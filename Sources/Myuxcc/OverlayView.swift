@@ -755,7 +755,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
                 updateHover(at: clampToBounds(convert(event.locationInWindow, from: nil)))
             }
         case .drawing:
-            if let d = draft, isBigEnough(d) {
+            // 松开鼠标完成绘制时，若使用画笔工具画出的线条比较直，则自动替换为直线
+            let finalized = currentTool == .pen ? draft?.straightenedIfNeeded() : draft
+            if let d = finalized, isBigEnough(d) {
                 recordUndo()
                 annotations.append(d)
                 selectedAnnotation = annotations.count - 1 // a new mark starts selected, as in PowerPoint

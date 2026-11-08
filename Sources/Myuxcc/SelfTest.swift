@@ -3,7 +3,7 @@ import AppKit
 /// `--selftest <out.png>`: renders a synthetic screen with every tool, no screen-recording permission needed.
 enum SelfTest {
     static func run(output: String) {
-        guard stitchTest() else { exit(1) }
+        guard penStraightenTest(), stitchTest() else { exit(1) }
         let size = CGSize(width: 400, height: 300), scale: CGFloat = 2
         let ctx = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale),
                             bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
@@ -34,6 +34,33 @@ enum SelfTest {
         try! data.write(to: URL(fileURLWithPath: output))
         print("selftest: wrote \(image.width)x\(image.height) to \(output)")
         exit(0)
+    }
+
+    /// 验证画笔工具的直线自动识别：带轻微手抖的近似直线应被替换为首尾两点，明显弯曲的曲线应保留原轨迹。
+    static func penStraightenTest() -> Bool {
+        // 带有手抖偏移的近似直线（长度 200pt，最大偏移 6pt）
+        let wobblyLine: [CGPoint] = [
+            CGPoint(x: 100, y: 100),
+            CGPoint(x: 150, y: 104),
+            CGPoint(x: 200, y: 95),
+            CGPoint(x: 250, y: 106),
+            CGPoint(x: 300, y: 102),
+        ]
+        let straightened = Annotation.straightenedPenPoints(wobblyLine)
+        let lineOK = straightened == [CGPoint(x: 100, y: 100), CGPoint(x: 300, y: 102)]
+
+        // 明显的折线/曲线（V 字形，偏移 40pt）不应被拉直
+        let curvePoints: [CGPoint] = [
+            CGPoint(x: 180, y: 180),
+            CGPoint(x: 220, y: 140),
+            CGPoint(x: 260, y: 180),
+        ]
+        let preserved = Annotation.straightenedPenPoints(curvePoints)
+        let curveOK = preserved == curvePoints
+
+        let pass = lineOK && curveOK
+        print("selftest: pen straighten \(pass ? "OK" : "FAILED") (line=\(straightened.count) pts, curve=\(preserved.count) pts)")
+        return pass
     }
 
     /// Scrolls a synthetic document under a window with a sticky header and footer, including a jump

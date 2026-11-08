@@ -201,6 +201,45 @@ extension Annotation {
         return isTip ? .arrow(a, p, color, width) : .arrow(p, b, color, width)
     }
 
+    /// 若当前标注是第四个工具（画笔）绘制的轨迹，且整体比较直，则自动替换为首尾相连的直线。
+    func straightenedIfNeeded() -> Annotation {
+        // 仅对不透明的画笔工具生效，保留荧光笔等其他工具的原样
+        guard case let .pen(points, color, width) = self, !isHighlighter else { return self }
+        return .pen(Annotation.straightenedPenPoints(points), color, width)
+    }
+
+    /// 识别画笔轨迹是否接近直线：在一定容差范围内比较直时，直接替换为 `[first, last]` 直线段。
+    static func straightenedPenPoints(_ points: [CGPoint]) -> [CGPoint] {
+        // 少于等于 2 个点本身就是直线段，直接返回
+        guard points.count > 2, let first = points.first, let last = points.last else { return points }
+        let dx = last.x - first.x, dy = last.y - first.y
+        let chord = hypot(dx, dy)
+        // 首尾距离太短（如点按或极短笔画）不触发直线替换
+        guard chord >= 12 else { return points }
+
+        // 允许的最大垂直偏移量：按首尾连线长度的 9% 放宽，短线至少容忍 8pt 手抖，长线最大封顶 28pt
+        let maxAllowedDeviation = min(max(8, chord * 0.09), 28)
+
+        // 检查轨迹累计长度与方向单调性，防止来回折返涂抹的线条被误判为直线
+        var pathLength: CGFloat = 0
+        var maxProjection: CGFloat = 0
+        for (a, b) in zip(points, points.dropFirst()) {
+            pathLength += hypot(b.x - a.x, b.y - a.y)
+            // 计算当前点在首尾连线方向上的投影位置，若向后折返超过容差则说明不是单向画线
+            let projection = ((b.x - first.x) * dx + (b.y - first.y) * dy) / chord
+            if maxProjection - projection > maxAllowedDeviation { return points }
+            maxProjection = max(maxProjection, projection)
+        }
+        // 实际轨迹总长度不能远超首尾直线距离（留出鼠标慢速采样的微小抖动余量）
+        guard pathLength <= chord * 1.35 else { return points }
+
+        // 检查所有中间采样点到首尾线段的最大垂直距离是否在容差范围内
+        let isStraight = points.dropFirst().dropLast().allSatisfy {
+            distance(from: $0, toSegment: first, last) <= maxAllowedDeviation
+        }
+        return isStraight ? [first, last] : points
+    }
+
     private func transformed(_ f: (CGPoint) -> CGPoint) -> Annotation {
         func rect(_ r: CGRect) -> CGRect {
             let a = f(CGPoint(x: r.minX, y: r.minY)), b = f(CGPoint(x: r.maxX, y: r.maxY))
