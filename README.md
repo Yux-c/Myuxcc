@@ -6,6 +6,10 @@
 
 基于 `Swift` + `AppKit` + `ScreenCaptureKit` + `Vision` + `Translation` 原生构建，不依赖任何第三方框架。
 
+<p align="center">
+  <img src="./Assets/demo-capture.gif" width="820" alt="Myuxcc 截图与标注过程演示" />
+</p>
+
 ## ✨ 核心特性
 
 | 模块 | 功能亮点 |

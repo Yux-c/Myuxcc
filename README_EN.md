@@ -6,6 +6,10 @@ A native, lightweight, zero-dependency all-in-one screenshot and productivity to
 
 Built purely with `Swift`, `AppKit`, `ScreenCaptureKit`, `Vision`, and `Translation` — zero third-party frameworks.
 
+<p align="center">
+  <img src="./Assets/demo-capture.gif" width="820" alt="Myuxcc Screenshot & Annotation Demo" />
+</p>
+
 ## ✨ Key Features
 
 | Module | Highlights |
