@@ -72,6 +72,8 @@ enum TextRecognizer {
     private static func recognizeInWorker(_ image: CGImage) async throws -> [RecognizedLine] {
         try await withCheckedThrowingContinuation { continuation in
             workerQueue.async {
+                // 每次使用兜底子进程时重置空闲回收计时器，避免子进程闲置后永久驻留后台
+                scheduleWorkerIdleStop()
                 do { continuation.resume(returning: try worker.recognize(image)) }
                 catch {
                     // A dead or wedged worker is replaced next time; do not keep a broken one around.
@@ -85,6 +87,20 @@ enum TextRecognizer {
     private static let worker = OCRWorkerProcess()
     /// Serialises the worker's request/response conversation.
     private static let workerQueue = DispatchQueue(label: "Myuxcc.ocrWorker", qos: .userInitiated)
+    /// 兜底 OCR 子进程空闲超时任务（闲置 120 秒后自动终止子进程释放内存）
+    nonisolated(unsafe) private static var workerIdleWorkItem: DispatchWorkItem?
+    /// 兜底 OCR 子进程的最大空闲保活时长（秒）
+    private static let workerIdleTimeout: TimeInterval = 120
+
+    /// 在 workerQueue 上重置子进程空闲自动退出计时器
+    private static func scheduleWorkerIdleStop() {
+        workerIdleWorkItem?.cancel()
+        let item = DispatchWorkItem {
+            worker.stop()
+        }
+        workerIdleWorkItem = item
+        workerQueue.asyncAfter(deadline: .now() + workerIdleTimeout, execute: item)
+    }
 
     /// The worker's pid, for the e2e test to kill it and check that a dead worker is replaced.
     static var workerPID: Int32? { worker.processIdentifier }
@@ -96,6 +112,7 @@ enum TextRecognizer {
         workerQueue.async {
             guard !worker.isRunning else { return }
             worker.warmUp()
+            scheduleWorkerIdleStop()
         }
     }
 

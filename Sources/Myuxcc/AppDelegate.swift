@@ -115,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             startShelf()
             TextRecognizer.warmUp()
-            TextRecognizer.warmUpWorker()
+            // 移除启动时无条件预热独立 --ocr-worker 子进程的调用，仅在进程内 Vision 引擎异常卡死时按需拉起，节省约 150MB 后台常驻内存
         }
         if CommandLine.arguments.contains("--settings") { openSettings() }
 

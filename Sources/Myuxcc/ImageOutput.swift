@@ -12,10 +12,13 @@ enum ImageOutput {
         guard let data = pngData(image) else { return }
         let pb = pasteboard
         pb.clearContents()
-        pb.setData(data, forType: .png)
-        // TIFF too, for apps that only read the legacy image type.
-        let nsImage = NSImage(cgImage: image, size: pointSize)
-        if let tiff = nsImage.tiffRepresentation { pb.setData(tiff, forType: .tiff) }
+        // 写入 PNG 并通过 TIFFProvider 按需懒加载提供 TIFF，避免每次截图复制都在主线程立即生成数十 MB 的未压缩 TIFF
+        let entry = NSPasteboardItem()
+        entry.setData(data, forType: .png)
+        let provider = TIFFProvider(png: data, pointSize: pointSize)
+        entry.setDataProvider(provider, forTypes: [.tiff])
+        TIFFProvider.current = provider
+        pb.writeObjects([entry])
     }
 
     @discardableResult

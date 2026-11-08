@@ -1119,6 +1119,17 @@ final class E2ETest {
         check("拖进网页链接存成 .webloc", droppedLink?.first?.lastPathComponent == "example.com - page.webloc", droppedLink?.first?.lastPathComponent ?? "nil")
         let droppedText = await drop { $0.setString("只是文字", forType: .string) }
         check("纯文字不收", droppedText == nil)
+        // 验证从中转板内部拖出的文件再次落回中转板时被忽略，不会自我克隆
+        if let internalItem = storage.items.first {
+            let selfDropped = await drop { $0.writeObjects([internalItem.url as NSURL]) }
+            check("中转板内部文件拖回自身不产生克隆副本", selfDropped == nil)
+        }
+        // 验证文件夹递归计算真实总字节数，不再显示 0 字节
+        let subFolder = source.appendingPathComponent("测试文件夹", isDirectory: true)
+        try? FileManager.default.createDirectory(at: subFolder, withIntermediateDirectories: true)
+        try? Data(repeating: 0x41, count: 2048).write(to: subFolder.appendingPathComponent("inner.bin"))
+        _ = await add([.file(subFolder, move: false)])
+        check("拖入文件夹递归统计真实大小（非 0 KB）", (storage.items.first?.fileSize ?? 0) >= 2048, "\(storage.items.first?.fileSize ?? -1)")
 
         // The shake gesture: fast swings while dragging content count, slow ones or a plain drag don't.
         let shake = ShakeDetector()
@@ -1328,6 +1339,9 @@ final class E2ETest {
         write("旧中转板", "ScshootDemo/Shelf/a.txt", in: support)
         write("旧剪贴板历史", "ScshootDemo/Clipboard/history.json", in: support)
         write("新中转板", "Myuxcc/Shelf/b.txt", in: support)
+        // 构造新旧两份 .clip-texts.json，验证迁移时会合并去重而非丢弃旧记录
+        write("[{\"id\":\"old-1\",\"text\":\"旧剪贴文字\",\"addedDate\":100}]", "ScshootDemo/Shelf/.clip-texts.json", in: support)
+        write("[{\"id\":\"new-1\",\"text\":\"新剪贴文字\",\"addedDate\":200}]", "Myuxcc/Shelf/.clip-texts.json", in: support)
         write("旧录屏", "ScshootDemo 录屏/录屏 1.mp4", in: movies)
         let oldDomain = "Myuxcc.e2e-migration-old", newDomain = "Myuxcc.e2e-migration-new"
         let defaults = UserDefaults(suiteName: newDomain)!
@@ -1341,6 +1355,8 @@ final class E2ETest {
         check("旧设置搬过来，新名字下已有的设置不被覆盖", defaults.integer(forKey: "shelfMaxItems") == 30 && defaults.string(forKey: "saveFolder") == "/tmp/新位置")
         check("中转板文件合并进 Myuxcc 文件夹，旧剪贴板历史保留", read("Myuxcc/Shelf/a.txt", in: support) == "旧中转板" && read("Myuxcc/Shelf/b.txt", in: support) == "新中转板"
               && read("Myuxcc/Clipboard/history.json", in: support) == "旧剪贴板历史" && !fm.fileExists(atPath: support.appendingPathComponent("ScshootDemo").path))
+        let mergedClipTexts = read("Myuxcc/Shelf/.clip-texts.json", in: support) ?? ""
+        check("新旧 .clip-texts.json 合并保留双方记录", mergedClipTexts.contains("旧剪贴文字") && mergedClipTexts.contains("新剪贴文字"), mergedClipTexts)
         check("录屏文件夹改名为「Myuxcc 录屏」", read("Myuxcc 录屏/录屏 1.mp4", in: movies) == "旧录屏" && !fm.fileExists(atPath: movies.appendingPathComponent("ScshootDemo 录屏").path))
         write("之后又出现的旧文件", "ScshootDemo/Shelf/c.txt", in: support)
         LegacyMigration.run(places)
@@ -1416,6 +1432,11 @@ final class E2ETest {
         try? "文件内容".write(to: source, atomically: true, encoding: .utf8)
         _ = await copy { $0.writeObjects([source as NSURL]) }
         check("访达里复制文件：复制一份进来", storage.items.first?.name == "复制的文件.txt")
+        // 验证同一外部文件再次复制时去重置顶，不产生「复制的文件 1.txt」
+        let countAfterFirstFile = storage.items.count
+        _ = await copy { $0.writeObjects([source as NSURL]) }
+        check("访达里重复复制同一未改动文件：去重移到最前，不生成副本",
+              storage.items.count == countAfterFirstFile && storage.items.first?.name == "复制的文件.txt")
         let concealed = await copy {
             $0.setString("密码123", forType: .string)
             $0.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
@@ -1600,6 +1621,11 @@ final class E2ETest {
         check("空格打开的预览栏随面板关闭，下次打开不显示", window.preview.isHidden && !window.peekOpen)
         window.togglePreview()
         check("按钮打开预览栏会一直显示", Settings.shelfShowsPreview && !window.preview.isHidden)
+        // 验证常驻开启预览栏时按空格键仅临时收起，不篡改 Settings.shelfShowsPreview
+        window.pointerInWindow = { rowCenter(window.selection) }
+        _ = window.handleSpace(space)
+        check("常驻预览开启时按空格：仅临时收起，不篡改持久化设置",
+              window.preview.isHidden && Settings.shelfShowsPreview)
         window.togglePreview()
         Settings.shelfShowsPreview = showed
         _ = window.control(window.searchField, textView: editor, doCommandBy: #selector(NSResponder.cancelOperation(_:)))

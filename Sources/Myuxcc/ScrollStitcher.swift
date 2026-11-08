@@ -545,6 +545,12 @@ final class ScrollStitcher {
         finishedImage = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: rowBytes,
                                 space: colorSpace, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
                                 provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        // 最终长截图 CGImage 生成完毕后，立即清空底层的中间画布缓冲、行状态与预览切片数组，削减长图导出时的内存峰值
+        canvas.removeAll(keepingCapacity: false)
+        rowStates.removeAll(keepingCapacity: false)
+        tiles.removeAll(keepingCapacity: false)
+        pending.removeAll(keepingCapacity: false)
+        written.removeAll(keepingCapacity: false)
         return finishedImage
     }
 

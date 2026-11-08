@@ -564,8 +564,15 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         }
     }
 
+    /// 撤销历史栈的最大步数上限，防止单次截图中反复拖动/微调标注导致历史快照无限增长
+    private static let maxUndoSteps = 50
+
     /// Saves the current marks so the next change can be undone.
     private func recordUndo() {
+        // 超出最大撤销步数时移除最早的历史快照，控制内存占用
+        if undoStack.count >= Self.maxUndoSteps {
+            undoStack.removeFirst(undoStack.count - Self.maxUndoSteps + 1)
+        }
         undoStack.append(annotations)
         redoStack.removeAll()
     }

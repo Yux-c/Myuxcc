@@ -43,12 +43,15 @@ final class ShelfPanel: NSPanel, NSWindowDelegate, NSSearchFieldDelegate {
     private var retractTimer: Timer?
     /// Opened with Space on the row under the pointer; closes with the panel.
     private(set) var peekOpen = false
+    /// 当用户默认开启常驻预览栏时，按空格键在本轮会话内临时收起预览栏，不覆盖持久化设置
+    private var peekClosed = false
     /// The pointer in window coordinates; the silent e2e test sets its own.
     var pointerInWindow: () -> NSPoint = { .zero }
     /// Whether the last layout had the preview, which sits left of the list and moves the panel's left edge.
     private var laidOutWithPreview = false
 
-    var showsPreview: Bool { Settings.shelfShowsPreview || peekOpen }
+    /// 结合持久化开关与当前会话内空格键的临时开闭状态计算是否展示预览栏
+    var showsPreview: Bool { (Settings.shelfShowsPreview && !peekClosed) || peekOpen }
     /// Where the list's left edge is on screen; the list stays put when the preview opens or closes.
     private var listLeft: CGFloat { frame.minX + (laidOutWithPreview ? Self.previewWidth : 0) }
 
@@ -232,11 +235,14 @@ final class ShelfPanel: NSPanel, NSWindowDelegate, NSSearchFieldDelegate {
     /// The button: closes the preview when it is open (also one opened with Space), otherwise keeps it
     /// open from now on.
     @objc func togglePreview() {
+        // 点击顶栏切换按钮时修改用户持久化配置，并清除本轮空格键的临时开闭状态
         if showsPreview {
             Settings.shelfShowsPreview = false
             peekOpen = false
+            peekClosed = false
         } else {
             Settings.shelfShowsPreview = true
+            peekClosed = false
         }
         layoutPanel()
         preview.show(selectedItem)
@@ -255,10 +261,12 @@ final class ShelfPanel: NSPanel, NSWindowDelegate, NSSearchFieldDelegate {
     func handleSpace(_ event: NSEvent) -> Bool {
         guard event.keyCode == 49, event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
               (searchField.currentEditor() as? NSTextView)?.hasMarkedText() != true, pointerOnSelection else { return false }
+        // 按空格键仅在本轮会话内临时开闭预览栏，绝不覆盖持久化的 Settings.shelfShowsPreview
         if showsPreview {
-            Settings.shelfShowsPreview = false
             peekOpen = false
+            peekClosed = true
         } else {
+            peekClosed = false
             peekOpen = true
         }
         layoutPanel()
@@ -298,7 +306,11 @@ final class ShelfPanel: NSPanel, NSWindowDelegate, NSSearchFieldDelegate {
         if !isShelfVisible || focus { searchField.stringValue = "" }
         focused = focus || (isShelfVisible && focused)
         ShelfStorage.shared.reload()
-        if !isShelfVisible { peekOpen = false }
+        // 每次从隐藏状态重新打开中转板时重置空格键的临时预览状态
+        if !isShelfVisible {
+            peekOpen = false
+            peekClosed = false
+        }
         let area = (NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main)?.visibleFrame ?? .zero
         // The pointer sits at the list's top-left corner; the preview, when open, extends to its left.
         var left = point.x + 12
@@ -328,6 +340,11 @@ final class ShelfPanel: NSPanel, NSWindowDelegate, NSSearchFieldDelegate {
         isShelfVisible = false
         focused = false
         peekOpen = false
+        peekClosed = false
+        // 隐藏中转板时释放预览大图与列表行视图，避免常驻后台持有大量 CALayer 与解码位图
+        preview.show(nil)
+        rows.forEach { $0.removeFromSuperview() }
+        rows.removeAll()
         if Self.silent { return }
         orderOut(nil)
     }
@@ -761,7 +778,12 @@ final class ThumbnailCache {
         QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] representation, _ in
             guard let image = representation?.nsImage else { return }
             DispatchQueue.main.async {
-                self?.cache.setObject(image, forKey: key)
+                // 计算缩略图近似字节开销（宽 × 高 × 4），使 NSCache.totalCostLimit(64MB) 对 QuickLook 缩略图同样生效
+                let rep = image.representations.first
+                let w = rep?.pixelsWide ?? max(Int(size * 2), 1)
+                let h = rep?.pixelsHigh ?? max(Int(size * 2), 1)
+                let cost = max(w * h * 4, 1)
+                self?.cache.setObject(image, forKey: key, cost: cost)
                 completion(image)
             }
         }

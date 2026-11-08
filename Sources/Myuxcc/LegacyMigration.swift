@@ -51,7 +51,13 @@ enum LegacyMigration {
                 if fm.fileExists(atPath: target.path) {
                     // Folders on both sides (Shelf, Clipboard) are merged one level further down.
                     var isDir: ObjCBool = false
-                    if fm.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue { merge(item, into: target) }
+                    if fm.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
+                        merge(item, into: target)
+                    } else if item.lastPathComponent == ".clip-texts.json" {
+                        // 新旧目录同时存在 `.clip-texts.json` 时，将旧剪贴板文本记录合并进新文件后删除旧文件
+                        mergeClipTexts(from: item, into: target)
+                        try? fm.removeItem(at: item)
+                    }
                 } else {
                     try fm.moveItem(at: item, to: target)
                 }
@@ -59,6 +65,21 @@ enum LegacyMigration {
             if (try? fm.contentsOfDirectory(atPath: old.path))?.isEmpty == true { try? fm.removeItem(at: old) }
         } catch {
             NSLog("Myuxcc: could not move \(old.path) to \(new.path): \(error)")
+        }
+    }
+
+    /// 合并旧版与新版的 `.clip-texts.json` 剪贴板文本记录（按文本内容去重并按时间倒序保留）。
+    private static func mergeClipTexts(from oldFile: URL, into newFile: URL) {
+        guard let oldData = try? Data(contentsOf: oldFile),
+              let oldRecords = try? JSONDecoder().decode([ClipTextRecord].self, from: oldData),
+              !oldRecords.isEmpty else { return }
+        var newRecords = (try? Data(contentsOf: newFile)).flatMap { try? JSONDecoder().decode([ClipTextRecord].self, from: $0) } ?? []
+        for record in oldRecords where !newRecords.contains(where: { $0.text == record.text }) {
+            newRecords.append(record)
+        }
+        newRecords.sort { $0.addedDate > $1.addedDate }
+        if let merged = try? JSONEncoder().encode(newRecords) {
+            try? merged.write(to: newFile, options: .atomic)
         }
     }
 }

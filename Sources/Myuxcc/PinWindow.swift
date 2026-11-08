@@ -308,6 +308,12 @@ final class PinWindowController: NSObject, NSWindowDelegate {
             shadowPanel.orderOut(nil)
             self.shadowPanel = nil
         }
+        // 关闭贴图窗口时显式释放视图图像、译文合成大图与 OCR 文本布局缓存，防止贴图大位图滞留内存
+        view.image = nil
+        view.setRecognizedLines([])
+        view.controller = nil
+        translated = nil
+        recognizedLines = nil
         PinWindowController.open.removeAll { $0 === self }
     }
 }

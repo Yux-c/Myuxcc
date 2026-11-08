@@ -113,6 +113,8 @@ enum ScreenTranslator {
             session = TranslationSession(installedSource: source, target: target)
             sessions[key] = session
         }
+        // 每次调用翻译后重置会话缓存的空闲清理计时器，闲置 5 分钟后自动释放 TranslationSession 缓存
+        scheduleSessionCleanup()
         var out = segments
         let requests = segments.enumerated().compactMap { i, segment in
             segment.trimmingCharacters(in: .whitespaces).isEmpty ? nil : TranslationSession.Request(sourceText: segment, clientIdentifier: "\(i)")
@@ -126,4 +128,20 @@ enum ScreenTranslator {
 
     /// One session per language pair; the first translation in a session takes ~0.5 s, later ones ~25 ms.
     @MainActor private static var sessions: [String: Any] = [:]
+    /// 翻译会话空闲清理任务，避免长时间不使用翻译功能时仍常驻持有系统翻译会话上下文
+    @MainActor private static var sessionCleanupWorkItem: DispatchWorkItem?
+    /// 翻译会话缓存的最大空闲保留时长（300 秒）
+    private static let sessionIdleTimeout: TimeInterval = 300
+
+    /// 重置翻译会话空闲回收计时器，超时后清空 sessions 字典
+    @MainActor private static func scheduleSessionCleanup() {
+        sessionCleanupWorkItem?.cancel()
+        let item = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                sessions.removeAll()
+            }
+        }
+        sessionCleanupWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + sessionIdleTimeout, execute: item)
+    }
 }

@@ -42,7 +42,17 @@ enum ShelfDrop {
         }
         // 1. Real files from Finder and most apps.
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            storage.importItems(urls.map { .file($0, move: false) }, completion: done)
+            // 过滤掉本来就已经在中转站目录内的文件，避免拖入自身目录造成重复拷贝
+            let fresh = urls.filter { $0.deletingLastPathComponent().standardizedFileURL != storage.folder.standardizedFileURL }
+            guard !fresh.isEmpty else { return false }
+            // 限制拖拽导入的总文件体积（100 MB），避免误拖超大视频或目录卡死后台队列并撑爆磁盘
+            guard fresh.reduce(0, { $0 + ClipboardWatcher.size(of: $1) }) <= ClipboardWatcher.fileSizeLimit else {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { if !ShelfPanel.silent { Toast.show("文件超过 100 MB，未放入剪贴中转板") } }
+                }
+                return false
+            }
+            storage.importItems(fresh.map { .file($0, move: false) }, completion: done)
             return true
         }
         // 2. File promises: the source app writes the file on demand.
@@ -50,10 +60,31 @@ enum ShelfDrop {
            !receivers.isEmpty {
             let destination = FileManager.default.temporaryDirectory.appendingPathComponent("Myuxcc-Promises-\(UUID().uuidString)", isDirectory: true)
             try? FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            // 使用 DispatchGroup 汇总所有承诺文件，并在移入中转站后清理临时目录，防止孤儿文件夹堆积和重复提示音
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var received: [URL] = []
             for receiver in receivers {
+                group.enter()
                 receiver.receivePromisedFiles(atDestination: destination, options: [:], operationQueue: promiseQueue) { url, error in
+                    defer { group.leave() }
                     if let error { NSLog("Myuxcc: could not receive a promised file: \(error)"); return }
-                    DispatchQueue.main.async { storage.importItems([.file(url, move: true)], completion: done) }
+                    lock.lock()
+                    received.append(url)
+                    lock.unlock()
+                }
+            }
+            group.notify(queue: .main) {
+                let valid = received.filter { ClipboardWatcher.size(of: $0) <= ClipboardWatcher.fileSizeLimit }
+                guard !valid.isEmpty else {
+                    try? FileManager.default.removeItem(at: destination)
+                    completion?([])
+                    return
+                }
+                storage.importItems(valid.map { .file($0, move: true) }) { added in
+                    // 临时文件移动完毕后，立即删除外层临时目录
+                    try? FileManager.default.removeItem(at: destination)
+                    done(added)
                 }
             }
             return true

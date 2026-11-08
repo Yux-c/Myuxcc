@@ -24,7 +24,7 @@ struct ShelvedItem: Equatable {
     var kind: FileKind { isClipText ? .document : FileKind(url: url) }
 }
 
-private struct ClipTextRecord: Codable {
+struct ClipTextRecord: Codable {
     var id: String
     var text: String
     var addedDate: Date
@@ -47,6 +47,8 @@ final class ShelfStorage {
     static let maxItemsRange = 5...100
     /// Copies share the list with files, so it keeps more than MacFileRelay's 20.
     static let defaultMaxItems = 50
+    /// 单条剪贴板文本最大保留字符数，防止数万行日志或大段 Base64 撑爆 `.clip-texts.json` 造成主线程解码卡顿与常驻内存膨胀。
+    static let maxClipTextCharacters = 50_000
 
     static var defaultFolder: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -146,12 +148,14 @@ final class ShelfStorage {
     }
 
     func reload() {
-        let keys: [URLResourceKey] = [.contentModificationDateKey, .creationDateKey, .fileSizeKey]
+        // 同时读取 isDirectoryKey：普通文件直接取 fileSize，文件夹或 .app 包递归统计真实体积，避免显示为 0 KB
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .creationDateKey, .fileSizeKey, .isDirectoryKey]
         let urls = (try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
         let fileItems = urls.map { url in
             let values = try? url.resourceValues(forKeys: Set(keys))
+            let size = values?.isDirectory == true ? ClipboardWatcher.size(of: url) : Int64(values?.fileSize ?? 0)
             return ShelvedItem(url: url, addedDate: values?.contentModificationDate ?? values?.creationDate ?? Date(),
-                               fileSize: Int64(values?.fileSize ?? 0))
+                               fileSize: size)
         }
         let textItems = loadTextRecords().map { record in
             ShelvedItem(url: textURL(for: record.id), addedDate: record.addedDate,
@@ -206,16 +210,18 @@ final class ShelfStorage {
     func importText(_ text: String, completion: ((URL?, Bool) -> Void)? = nil) {
         pendingImports += 1
         let limit = maxItems
+        // 对超长文本按上限截断，避免将数十 MB 的巨型文本写入同一个 JSON 文件
+        let storedText = text.count > Self.maxClipTextCharacters ? String(text.prefix(Self.maxClipTextCharacters)) : text
         importQueue.async {
             var records = self.loadTextRecords()
             let now = Date()
             let result: (URL, Bool)
-            if let index = records.firstIndex(where: { $0.text == text }) {
+            if let index = records.firstIndex(where: { $0.text == storedText }) {
                 records[index].addedDate = now
                 self.saveTextRecords(records)
                 result = (self.textURL(for: records[index].id), true)
             } else {
-                let record = ClipTextRecord(id: UUID().uuidString, text: text, addedDate: now)
+                let record = ClipTextRecord(id: UUID().uuidString, text: storedText, addedDate: now)
                 records.append(record)
                 self.saveTextRecords(records)
                 self.trim(to: limit)
@@ -301,23 +307,26 @@ final class ShelfStorage {
     }
 
     func remove(_ item: ShelvedItem) {
-        if item.isClipText {
-            importQueue.sync {
+        // 统一在 importQueue 中串行执行删除，避免与后台导入或 trim 产生并发文件竞争
+        importQueue.sync {
+            if item.isClipText {
                 var records = self.loadTextRecords()
                 records.removeAll { self.textURL(for: $0.id) == item.url || $0.text == item.clipText }
                 self.saveTextRecords(records)
+            } else {
+                try? self.discard(item.url)
             }
-        } else {
-            try? discard(item.url)
         }
         reload()
     }
 
     func clearAll() {
+        // 统一在 importQueue 中清理文本记录与磁盘文件，确保线程安全
         importQueue.sync {
             try? self.fileManager.removeItem(at: self.textsFile)
+            let urls = (try? self.fileManager.contentsOfDirectory(at: self.folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+            for url in urls { try? self.discard(url) }
         }
-        for item in items where !item.isClipText { try? discard(item.url) }
         reload()
     }
 

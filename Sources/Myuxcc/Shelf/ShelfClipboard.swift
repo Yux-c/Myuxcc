@@ -63,7 +63,19 @@ final class ClipboardWatcher {
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
             // Files already on the shelf (copied from it) are not copied again.
             let fresh = urls.filter { $0.deletingLastPathComponent().standardizedFileURL != storage.folder.standardizedFileURL }
-            guard !fresh.isEmpty, fresh.reduce(0, { $0 + Self.size(of: $1) }) <= Self.fileSizeLimit else { return false }
+            let totalSize = fresh.reduce(0) { $0 + Self.size(of: $1) }
+            guard !fresh.isEmpty, totalSize <= Self.fileSizeLimit else { return false }
+            // 在访达中重复复制同一个单文件时，若中转站已有同名同内容文件则直接置顶，避免产生 `文件名 1` 等重复副本
+            if fresh.count == 1, let file = fresh.first,
+               (try? file.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true {
+                let fileSize = totalSize
+                storage.importCopy(.file(file, move: false), sameAs: { url in
+                    url.lastPathComponent == file.lastPathComponent
+                        && Self.size(of: url) == fileSize
+                        && Self.contents(of: url) == Self.contents(of: file)
+                }, completion: done)
+                return true
+            }
             storage.importItems(fresh.map { .file($0, move: false) }) { completion?($0.first) }
             return true
         }
@@ -209,6 +221,8 @@ struct PasteboardSnapshot {
     }
 
     func restore(to pasteboard: NSPasteboard) {
+        // 恢复原剪贴板前释放临时粘贴图片的 TIFFProvider 静态引用，防止常驻占用内存
+        TIFFProvider.current = nil
         pasteboard.clearContents()
         guard !items.isEmpty else { return }
         pasteboard.writeObjects(items.map { entries in
@@ -220,16 +234,27 @@ struct PasteboardSnapshot {
 }
 
 /// Makes the TIFF version of a pasted image when an app that only reads TIFF asks for it.
-private final class TIFFProvider: NSObject, NSPasteboardItemDataProvider {
+final class TIFFProvider: NSObject, NSPasteboardItemDataProvider {
     /// Kept until the next paste replaces it, so the pasteboard can still ask.
     static var current: TIFFProvider?
     private let png: Data
+    private let pointSize: CGSize?
 
-    init(png: Data) { self.png = png }
+    init(png: Data, pointSize: CGSize? = nil) {
+        self.png = png
+        self.pointSize = pointSize
+    }
 
     func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
         autoreleasepool {
-            if let tiff = NSBitmapImageRep(data: png)?.tiffRepresentation { item.setData(tiff, forType: type) }
+            guard let rep = NSBitmapImageRep(data: png) else { return }
+            if let pointSize, pointSize.width > 0, pointSize.height > 0 { rep.size = pointSize }
+            if let tiff = rep.tiffRepresentation { item.setData(tiff, forType: type) }
         }
+    }
+
+    func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {
+        // 当系统剪贴板不再持有该数据提供者（用户复制了其他内容）时，自动释放静态强引用以回收 PNG 内存
+        if Self.current === self { Self.current = nil }
     }
 }
