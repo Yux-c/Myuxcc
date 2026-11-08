@@ -2,6 +2,15 @@
 
 [中文](./README.md) | [English](./README_EN.md)
 
+<p align="center">
+  <a href="https://github.com/Yux-c/Myuxcc/releases/latest">
+    <img src="https://img.shields.io/github/v/release/Yux-c/Myuxcc?color=blue&label=%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85%20(DMG)&logo=apple" alt="Download DMG">
+  </a>
+  <img src="https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey?logo=apple" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Swift-AppKit-orange?logo=swift" alt="Swift">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Yux-c/Myuxcc" alt="License"></a>
+</p>
+
 原生、轻量、零依赖的 macOS 全能截图效率工具。集**区域截图、标注编辑、滚动长截图、离线 OCR、原位截图翻译、区域录屏、桌面钉图**与**剪贴中转板**于一体。
 
 基于 `Swift` + `AppKit` + `ScreenCaptureKit` + `Vision` + `Translation` 原生构建，不依赖任何第三方框架。
@@ -68,3 +77,7 @@ open /Applications/Myuxcc.app
 - `Sources/Myuxcc/`：核心源码（截图会话、标注引擎、长截图拼接算法、OCR 与子进程守护、原位翻译、录屏、`Shelf/` 剪贴中转板）
 - `Icon/`：CoreGraphics 应用图标生成脚本与资源
 - `build.sh`：一键编译、签名与安装脚本
+
+## 📄 开源协议
+
+[MIT License](LICENSE) © 2026 Myuxcc Authors.

@@ -2,6 +2,15 @@
 
 [中文](./README.md) | [English](./README_EN.md)
 
+<p align="center">
+  <a href="https://github.com/Yux-c/Myuxcc/releases/latest">
+    <img src="https://img.shields.io/github/v/release/Yux-c/Myuxcc?color=blue&label=Download%20(DMG)&logo=apple" alt="Download DMG">
+  </a>
+  <img src="https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey?logo=apple" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Swift-AppKit-orange?logo=swift" alt="Swift">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Yux-c/Myuxcc" alt="License"></a>
+</p>
+
 A native, lightweight, zero-dependency all-in-one screenshot and productivity tool for macOS. **Myuxcc** combines **region capture, rich annotations, scrolling long capture, offline OCR, in-place image translation, screen recording, floating pin windows, and a clipboard & file shelf** in a single menu bar app.
 
 Built purely with `Swift`, `AppKit`, `ScreenCaptureKit`, `Vision`, and `Translation` — zero third-party frameworks.
@@ -68,3 +77,7 @@ open /Applications/Myuxcc.app
 - `Sources/Myuxcc/` — Core application source (capture session, annotations, scroll stitcher, Vision OCR & worker process, in-place translator, screen recorder, and `Shelf/` clipboard/file shelf)
 - `Icon/` — CoreGraphics procedural app icon generator and assets
 - `build.sh` — Build, code-sign, and installation script
+
+## 📄 License
+
+[MIT License](LICENSE) © 2026 Myuxcc Authors.
