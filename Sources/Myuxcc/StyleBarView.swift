@@ -49,7 +49,8 @@ final class StyleBarView: NSVisualEffectView {
         separator.heightAnchor.constraint(equalToConstant: 18).isActive = true
         stack.addArrangedSubview(separator)
         for (i, name) in Self.sizeNames.enumerated() {
-            let b = Self.button(Self.dot(diameter: [4, 7, 11][i]), name, target, #selector(OverlayView.pickSize(_:)), tag: i)
+            // 与加粗后的三档标注线宽对应，圆点直径同步微调为 5 / 8 / 12 pt
+            let b = Self.button(Self.dot(diameter: [5, 8, 12][i]), name, target, #selector(OverlayView.pickSize(_:)), tag: i)
             sizeButtons.append(b)
             stack.addArrangedSubview(b)
         }
@@ -121,7 +122,8 @@ private final class StyleButton: NSButton {
 
 /// The stroke width, text size and colour each size step and palette entry stand for.
 enum MarkStyle {
-    static let shapeWidths: [CGFloat] = [2, 3, 6]
+    /// 细 / 中 / 粗三档标注线宽（由原先 [2, 3, 6] 适度加粗至 [3, 4.5, 7.5]，让截图标注框更加醒目饱满）
+    static let shapeWidths: [CGFloat] = [3, 4.5, 7.5]
     static let highlighterWidths: [CGFloat] = [10, 16, 24]
     static let textSizes: [CGFloat] = [14, 20, 30]
     static let highlighterAlpha: CGFloat = 0.4

@@ -59,6 +59,27 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     }
     private var dragMode: DragMode = .none
     private var mouseLocation: CGPoint?
+    /// 触控板三指拖移/轻点拖移松手后，在系统延迟发送 mouseUp 窗口期内暂存的拖拽状态。
+    /// 使松手后能立即完成框选或将新建标注转为选中态，同时若用户在系统延迟期内继续拖动也能无缝衔接。
+    private struct LatchedDrag {
+        let mode: DragMode
+        /// 提前提交前的草稿标注（用于继续拖动时无缝恢复，特别是画笔/荧光笔的采样点序列）
+        let rawDraft: Annotation?
+        /// 是否已将草稿标注追加到 annotations 及 undoStack
+        let committedAnnotation: Bool
+        /// 提前提交前的标注编辑快照（用于标注移动/缩放继续拖动时恢复）
+        let markEditSnapshot: [Annotation]?
+        /// 是否已将标注编辑快照压入 undoStack
+        let committedMarkEditUndo: Bool
+    }
+    private var latchedDrag: LatchedDrag?
+    /// 当前拖拽过程中触控板同时接触的最大手指数（用于识别三指拖移或轻点拖移抬手）
+    private var maxTrackpadTouchesInDrag = 0
+    /// 针对 macOS 三指拖移（系统底层会屏蔽 NSTouch 并延迟约 0.45 秒才发送 mouseUp）的释放检测定时器：
+    /// 当拖拽停止移动短暂时间后立即完成框选/选中标注，无需干等系统延迟超时。
+    private var dragReleaseWorkItem: DispatchWorkItem?
+    /// 拖拽停止移动后提前进入完成/选中态的等待阈值（秒）
+    private static let dragReleaseDelay: TimeInterval = 0.065
 
     private(set) lazy var toolbar = ToolbarView(target: self)
     private(set) lazy var styleBar = StyleBarView(target: self)
@@ -67,6 +88,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     init(frame: CGRect, frozen: CGImage) {
         self.frozen = frozen
         super.init(frame: frame)
+        // 开启触控板间接接触事件（NSTouch），用于在轻点拖移/触控板松手瞬间立即结束拖拽
+        allowedTouchTypes = [.indirect]
         toolbar.isHidden = true
         // Sized from the start, so a layout pass before the first selection doesn't fight its constraints.
         toolbar.frame.size = toolbar.fittingSize
@@ -87,6 +110,12 @@ final class OverlayView: NSView, NSTextFieldDelegate {
 
     func clearSelection() {
         commitTextEditing()
+        cancelDragReleaseTimer()
+        dragMode = .none
+        latchedDrag = nil
+        maxTrackpadTouchesInDrag = 0
+        draft = nil
+        markEditSnapshot = nil
         selection = nil
         annotations.removeAll()
         undoStack.removeAll()
@@ -121,6 +150,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     /// Renders the selected region with its annotations at native pixel resolution.
     func renderSelection() -> CGImage? {
         commitTextEditing()
+        // 导出截图前强制结算尚未收到 mouseUp 的拖拽（如触控板三指拖移延迟期内直接按 Return）
+        finishActiveDrag()
         guard let sel = selection?.integral, sel.width > 0, sel.height > 0 else { return nil }
         let scale = CGFloat(frozen.width) / bounds.width
         let pw = Int(sel.width * scale), ph = Int(sel.height * scale)
@@ -142,6 +173,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
 
     /// Seeds a selection and marks without mouse input; used by `--selftest`.
     func loadForTesting(selection: CGRect, annotations: [Annotation]) {
+        // 重置残留的拖拽、工具与选中状态，确保多轮自测互不干扰
+        clearSelection()
         self.selection = selection
         self.annotations = annotations
     }
@@ -165,8 +198,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         guard let sel = selection else {
             if let hover = hoverRect {
                 NSColor.systemBlue.setStroke()
-                let border = NSBezierPath(rect: hover.insetBy(dx: 1, dy: 1))
-                border.lineWidth = 2
+                // 加粗悬停高亮框线宽，使窗口吸附预览边框更醒目清晰
+                let border = NSBezierPath(rect: hover.insetBy(dx: 1.25, dy: 1.25))
+                border.lineWidth = 2.5
                 border.stroke()
                 drawSizeLabel(for: hover)
             }
@@ -181,17 +215,21 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         NSGraphicsContext.restoreGraphicsState()
 
         NSColor.systemBlue.setStroke()
-        let border = NSBezierPath(rect: sel.insetBy(dx: -0.5, dy: -0.5))
-        border.lineWidth = 1
+        // 将截图选区边框从 1pt 加粗至 2.2pt，解决原先选区框过细、在复杂背景上不够明显的问题
+        let border = NSBezierPath(rect: sel.insetBy(dx: -1.1, dy: -1.1))
+        border.lineWidth = 2.2
         border.stroke()
 
         if currentTool == nil {
             for h in Handle.allCases {
                 let r = handleRect(h, in: sel)
                 NSColor.white.setFill()
-                NSBezierPath(ovalIn: r).fill()
+                let oval = NSBezierPath(ovalIn: r)
+                oval.fill()
                 NSColor.systemBlue.setStroke()
-                NSBezierPath(ovalIn: r).stroke()
+                // 同步加粗选区控制点描边，与加粗后的选区外框保持视觉协调
+                oval.lineWidth = 1.5
+                oval.stroke()
             }
         }
         drawMarkSelection()
@@ -213,8 +251,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         NSColor.black.withAlphaComponent(0.4).setFill()
         dim.fill()
         NSColor.systemBlue.setStroke()
-        let border = NSBezierPath(rect: sel.insetBy(dx: -1.5, dy: -1.5))
-        border.lineWidth = 2
+        let border = NSBezierPath(rect: sel.insetBy(dx: -1.25, dy: -1.25))
+        border.lineWidth = 2.5
         border.stroke()
     }
 
@@ -228,7 +266,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         }
         let box = mark.bounds
         let outline = NSBezierPath(rect: box.insetBy(dx: -3, dy: -3))
-        outline.lineWidth = 1
+        // 加粗选中标注的双色虚线框与控制点描边，提升选中态的清晰度
+        outline.lineWidth = 1.4
         outline.setLineDash([4, 3], count: 2, phase: 0)
         NSColor.white.setStroke()
         outline.stroke()
@@ -242,9 +281,11 @@ final class OverlayView: NSView, NSTextFieldDelegate {
 
     private func drawHandle(_ r: CGRect) {
         NSColor.white.setFill()
-        NSBezierPath(rect: r).fill()
+        let path = NSBezierPath(rect: r)
+        path.fill()
         NSColor.systemBlue.setStroke()
-        NSBezierPath(rect: r).stroke()
+        path.lineWidth = 1.4
+        path.stroke()
     }
 
     private func drawFrozen(in ctx: CGContext) {
@@ -477,6 +518,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
 
     /// Sets the style for the next marks and restyles the selected mark (undoably) or the text being typed.
     private func applyStyle(colorIndex: Int?, sizeIndex: Int?) {
+        // 切换颜色或粗细前先落盘可能处于触控板延迟期的拖拽
+        finishActiveDrag()
         guard let target = styleTarget else { return }
         if let colorIndex {
             if target == .highlighter { MarkStyle.highlighterColorIndex = colorIndex } else { MarkStyle.colorIndex = colorIndex }
@@ -594,6 +637,170 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         needsDisplay = true
     }
 
+    // MARK: - Drag settlement & Trackpad release
+
+    /// 取消未触发的触控板拖拽静止收尾定时器
+    private func cancelDragReleaseTimer() {
+        dragReleaseWorkItem?.cancel()
+        dragReleaseWorkItem = nil
+    }
+
+    /// 重置触控板拖拽静止收尾定时器：当连续 65ms 未收到新的 mouseDragged 时，立即进入选中态并显示工具栏
+    private func scheduleDragReleaseTimer() {
+        cancelDragReleaseTimer()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.dragReleaseWorkItem = nil
+            // 若当前仍在拖拽（系统尚未派发延迟的 mouseUp），提前结算并允许后续无缝续接
+            if case .none = self.dragMode { return }
+            self.completeDrag(at: self.mouseLocation, latchForContinuation: true)
+        }
+        dragReleaseWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.dragReleaseDelay, execute: work)
+    }
+
+    /// 立即终结任何正在进行或暂存待续接的拖拽（在按下回车/快捷键/点击按钮/导出图片前调用）
+    func finishActiveDrag() {
+        cancelDragReleaseTimer()
+        maxTrackpadTouchesInDrag = 0
+        if case .none = dragMode {
+            // 若已提前结算在 latchedDrag 中，直接清除暂存即可（标注与选区已在数组中）
+            latchedDrag = nil
+            return
+        }
+        completeDrag(at: mouseLocation, latchForContinuation: false)
+    }
+
+    /// 结算当前拖拽状态（将选区或绘制中的 draft 立即转为完成/选中态）
+    /// - Parameters:
+    ///   - location: 松开时的鼠标位置
+    ///   - latchForContinuation: 是否保存现场以便在三指拖移宽限期内继续拖动时无缝恢复
+    private func completeDrag(at location: CGPoint?, latchForContinuation: Bool) {
+        cancelDragReleaseTimer()
+        let currentMode = dragMode
+        if case .none = currentMode { return }
+        // 保存原始草稿和编辑快照以便后续续接时无损回退
+        let savedDraft = draft
+        let savedSnapshot = markEditSnapshot
+        var didCommitDrawing = false
+        var didRecordEditUndo = false
+
+        switch currentMode {
+        case .creating:
+            if let sel = selection, sel.width >= 4, sel.height >= 4 {
+                layoutToolbar()
+            } else if selection == nil, let snapped = hoverRect {
+                // 仅在真正收到 mouseUp 时才将未拖动的点击吸附为窗口选区；提前定时器触发时不抢先吸附
+                if !latchForContinuation {
+                    selection = snapped
+                    hoverRect = nil
+                    layoutToolbar()
+                } else {
+                    return
+                }
+            } else if !latchForContinuation {
+                selection = nil
+                if let p = location { updateHover(at: p) }
+            } else {
+                return
+            }
+        case .drawing:
+            // 松开鼠标或触控板停顿时，若使用画笔工具画出的线条比较直，则自动替换为直线
+            let finalized = currentTool == .pen ? draft?.straightenedIfNeeded() : draft
+            if let d = finalized, isBigEnough(d) {
+                recordUndo()
+                annotations.append(d)
+                selectedAnnotation = annotations.count - 1 // 新画出的框立即变为选中态（显示虚线框和 8 个控制点）
+                didCommitDrawing = true
+            } else if latchForContinuation {
+                // 还没拖出足够大的图形时不提前结束，等待继续拖动或最终 mouseUp
+                return
+            }
+            draft = nil
+            layoutToolbar()
+        case .markMoving, .markResizing, .arrowEnd:
+            // 仅当标注实际发生位移或尺寸变化时才记录撤销步
+            if let before = markEditSnapshot, before.count == annotations.count,
+               zip(before, annotations).contains(where: { $0.bounds != $1.bounds }) {
+                undoStack.append(before)
+                redoStack.removeAll()
+                didRecordEditUndo = true
+            }
+            markEditSnapshot = nil
+            layoutToolbar()
+        default:
+            break
+        }
+
+        if latchForContinuation {
+            // 记录提前结算前的现场；若三指拖移未真正结束而继续滑动，可无缝恢复拖拽
+            latchedDrag = LatchedDrag(
+                mode: currentMode,
+                rawDraft: savedDraft,
+                committedAnnotation: didCommitDrawing,
+                markEditSnapshot: savedSnapshot,
+                committedMarkEditUndo: didRecordEditUndo
+            )
+        } else {
+            latchedDrag = nil
+        }
+        dragMode = .none
+        needsDisplay = true
+    }
+
+    /// 当处于提前结算态但系统尚未派发 mouseUp、且用户又继续滑动鼠标/触控板时，无损恢复原拖拽状态
+    private func resumeLatchedDragIfNeeded() {
+        guard case .none = dragMode, let latched = latchedDrag else { return }
+        latchedDrag = nil
+        dragMode = latched.mode
+        switch latched.mode {
+        case .drawing:
+            // 撤回提前提交的临时标注与撤销记录，放回 draft 继续跟随鼠标绘制
+            if latched.committedAnnotation {
+                if !annotations.isEmpty { annotations.removeLast() }
+                _ = undoStack.popLast()
+                selectedAnnotation = nil
+            }
+            draft = latched.rawDraft
+        case .markMoving, .markResizing, .arrowEnd:
+            // 撤回提前压入的编辑撤销记录，恢复 markEditSnapshot 继续调整
+            if latched.committedMarkEditUndo {
+                _ = undoStack.popLast()
+            }
+            markEditSnapshot = latched.markEditSnapshot
+        default:
+            break
+        }
+    }
+
+    // MARK: - Trackpad touches
+
+    override func touchesBegan(with event: NSEvent) {
+        // 记录拖拽期间触控板上的最大触点数，用于识别单指轻点拖移或三指拖移抬起
+        let count = event.touches(matching: [.began, .moved, .stationary], in: self).count
+        if count > maxTrackpadTouchesInDrag { maxTrackpadTouchesInDrag = count }
+    }
+
+    override func touchesMoved(with event: NSEvent) {
+        let count = event.touches(matching: [.began, .moved, .stationary], in: self).count
+        if count > maxTrackpadTouchesInDrag { maxTrackpadTouchesInDrag = count }
+    }
+
+    override func touchesEnded(with event: NSEvent) {
+        // 当正在拖拽且触控板上所有手指均已抬起时，无需等待系统 0.45 秒延迟，立即结算为选中态
+        guard maxTrackpadTouchesInDrag > 0 else { return }
+        let remaining = event.touches(matching: [.began, .moved, .stationary], in: self).count
+        if remaining == 0 {
+            maxTrackpadTouchesInDrag = 0
+            if case .none = dragMode { return }
+            completeDrag(at: mouseLocation, latchForContinuation: true)
+        }
+    }
+
+    override func touchesCancelled(with event: NSEvent) {
+        maxTrackpadTouchesInDrag = 0
+    }
+
     // MARK: - Mouse
 
     override func mouseMoved(with event: NSEvent) {
@@ -626,6 +833,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // 新一轮按下前先清理上一次可能残留的延迟拖拽状态
+        finishActiveDrag()
         let p = clampToBounds(convert(event.locationInWindow, from: nil))
         commitTextEditing()
 
@@ -692,6 +901,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     override func mouseDragged(with event: NSEvent) {
         let p = clampToBounds(convert(event.locationInWindow, from: nil))
         mouseLocation = p
+        // 若此前因 65ms 停顿已提前结算为选中态，但用户在三指拖移宽限期内继续滑动，则无缝恢复原拖拽
+        resumeLatchedDragIfNeeded()
         switch dragMode {
         case .none:
             return
@@ -745,49 +956,26 @@ final class OverlayView: NSView, NSTextFieldDelegate {
             case .text: break
             }
         }
+        // 启动/重置 65ms 静止检测定时器，避免触控板三指拖移抬手后苦等系统 0.45s 延迟才进入选中态
+        scheduleDragReleaseTimer()
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
-        switch dragMode {
-        case .creating:
-            if let sel = selection, sel.width >= 4, sel.height >= 4 {
-                layoutToolbar()
-            } else if selection == nil, let snapped = hoverRect {
-                selection = snapped
-                hoverRect = nil
-                layoutToolbar()
-            } else {
-                selection = nil
-                updateHover(at: clampToBounds(convert(event.locationInWindow, from: nil)))
-            }
-        case .drawing:
-            // 松开鼠标完成绘制时，若使用画笔工具画出的线条比较直，则自动替换为直线
-            let finalized = currentTool == .pen ? draft?.straightenedIfNeeded() : draft
-            if let d = finalized, isBigEnough(d) {
-                recordUndo()
-                annotations.append(d)
-                selectedAnnotation = annotations.count - 1 // a new mark starts selected, as in PowerPoint
-            }
-            draft = nil
-            layoutToolbar()
-        case .markMoving, .markResizing, .arrowEnd:
-            // Only a drag that actually changed the mark is worth an undo step.
-            if let before = markEditSnapshot, before.count == annotations.count,
-               zip(before, annotations).contains(where: { $0.bounds != $1.bounds }) {
-                undoStack.append(before)
-                redoStack.removeAll()
-            }
-            markEditSnapshot = nil
-            layoutToolbar()
-        default:
-            break
+        let p = clampToBounds(convert(event.locationInWindow, from: nil))
+        cancelDragReleaseTimer()
+        maxTrackpadTouchesInDrag = 0
+        // 若此前已通过触控板抬手或 65ms 静止定时器提前结算完毕，清空暂存现场即可
+        if case .none = dragMode, latchedDrag != nil {
+            latchedDrag = nil
+            needsDisplay = true
+            return
         }
-        dragMode = .none
-        needsDisplay = true
+        completeDrag(at: p, latchForContinuation: false)
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        finishActiveDrag()
         // Right click: drop the selection first, exit when there is none (common screenshot-tool convention).
         if selection != nil { clearSelection() } else { delegate?.overlay(self, finishWith: .cancel) }
     }
@@ -795,6 +983,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     // MARK: - Keyboard
 
     override func keyDown(with event: NSEvent) {
+        // 按下任何快捷键（如 Return、⌘C、⌘S、Delete、方向键等）前，立即结算正在进行的拖拽或绘制草稿，
+        // 彻底避免框选/画框刚结束（处于触控板三指拖移松开延迟期）直接按 Return 时漏画标注或无法完成截图
+        finishActiveDrag()
         let cmd = event.modifierFlags.contains(.command)
         let shift = event.modifierFlags.contains(.shift)
         if isLongCapture {
@@ -805,12 +996,6 @@ final class OverlayView: NSView, NSTextFieldDelegate {
             default: super.keyDown(with: event)
             }
             return
-        }
-        switch dragMode {
-        case .markMoving, .markResizing, .arrowEnd:
-            return // the drag holds an index into `annotations`; don't change them under it
-        default:
-            break
         }
         switch (event.keyCode, cmd) {
         case (53, _): // Esc: deselect the mark first, exit on the next press
@@ -924,6 +1109,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     // MARK: - Toolbar actions
 
     @objc func selectTool(_ sender: NSButton) {
+        finishActiveDrag()
         commitTextEditing()
         let tool = Tool.allCases[sender.tag]
         currentTool = (currentTool == tool) ? nil : tool
@@ -933,6 +1119,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     }
 
     @objc func undo() {
+        finishActiveDrag()
         commitTextEditing()
         guard let previous = undoStack.popLast() else { return }
         redoStack.append(annotations)
@@ -943,6 +1130,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     }
 
     @objc func redo() {
+        finishActiveDrag()
         commitTextEditing()
         guard let next = redoStack.popLast() else { return }
         undoStack.append(annotations)
@@ -952,10 +1140,11 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         needsDisplay = true
     }
 
-    @objc func pin() { delegate?.overlay(self, finishWith: .pin) }
-    @objc func recognizeText() { delegate?.overlay(self, finishWith: .recognizeText) }
-    @objc func translate() { delegate?.overlay(self, finishWith: .translate) }
+    @objc func pin() { finishActiveDrag(); delegate?.overlay(self, finishWith: .pin) }
+    @objc func recognizeText() { finishActiveDrag(); delegate?.overlay(self, finishWith: .recognizeText) }
+    @objc func translate() { finishActiveDrag(); delegate?.overlay(self, finishWith: .translate) }
     @objc func longCapture() {
+        finishActiveDrag()
         commitTextEditing()
         // Like FloGravity, switching to long capture is only offered before annotating.
         guard selection != nil, annotations.isEmpty else { return }
@@ -963,6 +1152,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     }
 
     @objc func recordScreen() {
+        finishActiveDrag()
         commitTextEditing()
         guard selection != nil, annotations.isEmpty else { return }
         delegate?.overlayDidRequestRecording(self)
@@ -971,6 +1161,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     /// The live screen shows through from now on; the session's window ignores the mouse so the
     /// user can scroll the app underneath.
     func enterLongCaptureMode() {
+        cancelDragReleaseTimer()
+        latchedDrag = nil
+        maxTrackpadTouchesInDrag = 0
         isLongCapture = true
         toolbar.isHidden = true
         hoverRect = nil
@@ -979,7 +1172,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         dragMode = .none
         needsDisplay = true
     }
-    @objc func save() { delegate?.overlay(self, finishWith: .save) }
-    @objc func cancel() { delegate?.overlay(self, finishWith: .cancel) }
-    @objc func copyAndClose() { delegate?.overlay(self, finishWith: .copy) }
+    @objc func save() { finishActiveDrag(); delegate?.overlay(self, finishWith: .save) }
+    @objc func cancel() { finishActiveDrag(); delegate?.overlay(self, finishWith: .cancel) }
+    @objc func copyAndClose() { finishActiveDrag(); delegate?.overlay(self, finishWith: .copy) }
 }

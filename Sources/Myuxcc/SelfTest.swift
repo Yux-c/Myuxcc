@@ -3,7 +3,7 @@ import AppKit
 /// `--selftest <out.png>`: renders a synthetic screen with every tool, no screen-recording permission needed.
 enum SelfTest {
     static func run(output: String) {
-        guard penStraightenTest(), stitchTest() else { exit(1) }
+        guard penStraightenTest(), dragSettlementTest(), toolbarIconsTest(), stitchTest() else { exit(1) }
         let size = CGSize(width: 400, height: 300), scale: CGFloat = 2
         let ctx = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale),
                             bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
@@ -61,6 +61,106 @@ enum SelfTest {
         let pass = lineOK && curveOK
         print("selftest: pen straighten \(pass ? "OK" : "FAILED") (line=\(straightened.count) pts, curve=\(preserved.count) pts)")
         return pass
+    }
+
+    /// 验证触控板三指拖移/框选结束的立即结算与无缝续接：
+    /// 1) 拖出矩形框后未收到 mouseUp 直接导出/按回车时，草稿矩形必须落盘并绘入成图（解决框选完直接按 Return 漏框问题）；
+    /// 2) 拖拽停顿超过 65ms（模拟三指拖移抬手但系统延迟 0.45s 才发 mouseUp）时自动进入选中态，
+    ///    且在真正 mouseUp 前继续拖动可无损续接调整同一矩形，不会重复追加标注或撤销记录。
+    static func dragSettlementTest() -> Bool {
+        let size = CGSize(width: 300, height: 200)
+        let frozen = solid(300, 200, r: 20, g: 20, b: 20)
+        let win = NSWindow(contentRect: CGRect(origin: .zero, size: size), styleMask: .borderless, backing: .buffered, defer: false)
+        let view = OverlayView(frame: CGRect(origin: .zero, size: size), frozen: frozen)
+        win.contentView = view
+
+        // 构造窗口坐标下的鼠标事件（OverlayView.isFlipped 为 true，y 需翻转）
+        func ev(_ type: NSEvent.EventType, _ x: CGFloat, _ y: CGFloat) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: CGPoint(x: x, y: size.height - y), modifierFlags: [],
+                               timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: win.windowNumber,
+                               context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+
+        // 场景 1：框选区域后拖出一个红框，尚未收到 mouseUp 即刻调用 renderSelection()（等价于直接按 Return）
+        view.loadForTesting(selection: CGRect(x: 10, y: 10, width: 260, height: 160), annotations: [])
+        let rectBtn = NSButton(); rectBtn.tag = 0 // 0 = rectangle
+        view.selectTool(rectBtn)
+        view.mouseDown(with: ev(.leftMouseDown, 40, 40))
+        view.mouseDragged(with: ev(.leftMouseDragged, 140, 100))
+        guard let img = view.renderSelection(), let px = PixelFrame(img) else {
+            print("selftest: drag settlement FAILED (renderSelection returned nil)")
+            return false
+        }
+        // 矩形顶边中点 (x=90, y=40) 相对于选区起点 (10, 10) 为 (80, 30)，应已画上红色边框
+        let borderIdx = (30 * px.width + 80) * 4
+        let hasRedBoxOnImmediateReturn = view.annotations.count == 1
+            && view.selectedAnnotation == 0
+            && px.pixels[borderIdx] > 180 && px.pixels[borderIdx + 1] < 80
+
+        // 场景 2：拖拽停顿 65ms 自动变为选中态 + 宽限期内继续拖动无损续接 + 延迟 mouseUp 收尾
+        view.loadForTesting(selection: CGRect(x: 10, y: 10, width: 260, height: 160), annotations: [])
+        view.selectTool(rectBtn)
+        view.mouseDown(with: ev(.leftMouseDown, 30, 30))
+        view.mouseDragged(with: ev(.leftMouseDragged, 110, 80))
+        // 等待 90ms 让 65ms 静止结算定时器触发
+        RunLoop.current.run(until: Date().addingTimeInterval(0.09))
+        let autoSelectedBeforeMouseUp = view.annotations.count == 1 && view.selectedAnnotation == 0
+        // 在系统延迟的 mouseUp 到来前继续滑动到 (170, 120)，应恢复原拖拽而非新建第二个框
+        view.mouseDragged(with: ev(.leftMouseDragged, 170, 120))
+        view.mouseUp(with: ev(.leftMouseUp, 170, 120))
+        let resumedCleanly = view.annotations.count == 1
+            && view.selectedAnnotation == 0
+            && view.annotations[0].bounds == CGRect(x: 30, y: 30, width: 140, height: 90)
+
+        let pass = hasRedBoxOnImmediateReturn && autoSelectedBeforeMouseUp && resumedCleanly
+        print("selftest: drag settlement \(pass ? "OK" : "FAILED") (immediateReturn=\(hasRedBoxOnImmediateReturn), autoSelect=\(autoSelectedBeforeMouseUp), resume=\(resumedCleanly))")
+        return pass
+    }
+
+    /// 验证自定义工具栏矢量图标体系：全部 17 个图标均能正常绘制且输出高清预览图供视觉核验
+    static func toolbarIconsTest() -> Bool {
+        let kinds: [ToolbarView.IconKind] = Tool.allCases.map { .tool($0) } + [
+            .undo, .redo, .longCapture, .record, .ocr, .translate, .pin, .save, .cancel, .done,
+        ]
+        let cellW: CGFloat = 44, h: CGFloat = 48, scale: CGFloat = 3
+        let totalW = CGFloat(kinds.count) * cellW + 16
+        guard let ctx = CGContext(data: nil, width: Int(totalW * scale), height: Int(h * scale),
+                                  bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        ctx.scaleBy(x: scale, y: scale)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        // 模拟深色毛玻璃 HUD 底板
+        NSColor(srgbRed: 0.14, green: 0.14, blue: 0.16, alpha: 1).setFill()
+        NSBezierPath(roundedRect: CGRect(x: 2, y: 2, width: totalW - 4, height: h - 4), xRadius: 12, yRadius: 12).fill()
+
+        var allNonEmpty = true
+        for (i, kind) in kinds.enumerated() {
+            let icon = ToolbarView.icon(for: kind)
+            let x = 8 + CGFloat(i) * cellW + (cellW - 20) / 2
+            let y = (h - 20) / 2
+            // 在单独小画布中渲染模板图标并着色为白色（取消/完成分别着红/绿色）
+            let tint: NSColor
+            switch kind {
+            case .cancel: tint = NSColor(srgbRed: 1.0, green: 0.36, blue: 0.34, alpha: 1)
+            case .done: tint = NSColor(srgbRed: 0.22, green: 0.84, blue: 0.44, alpha: 1)
+            default: tint = .white
+            }
+            let tinted = NSImage(size: icon.size, flipped: false) { r in
+                icon.draw(in: r)
+                tint.setFill()
+                r.fill(using: .sourceAtop)
+                return true
+            }
+            tinted.draw(in: CGRect(x: x, y: y, width: 20, height: 20))
+            if icon.tiffRepresentation == nil { allNonEmpty = false }
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        if let cg = ctx.makeImage(), let data = ImageOutput.pngData(cg) {
+            try? data.write(to: URL(fileURLWithPath: "/tmp/myuxcc-toolbar-preview.png"))
+        }
+        print("selftest: toolbar icons \(allNonEmpty ? "OK" : "FAILED") (\(kinds.count) icons)")
+        return allNonEmpty
     }
 
     /// Scrolls a synthetic document under a window with a sticky header and footer, including a jump
