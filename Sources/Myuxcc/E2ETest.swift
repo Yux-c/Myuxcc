@@ -1262,47 +1262,80 @@ final class E2ETest {
         }
     }
 
-    /// The settings window laid out off screen: every row keeps both columns, only section titles span
-    /// them, and no two rows overlap.
+    /// 验证设置窗口三大分类标签（通用、截图与录屏、剪贴中转板）离线布局：卡片与各行尺寸完整、互不重叠，条件告警行收起不留空隙。
     private func caseSettingsLayout() {
         log("== 设置窗口布局（不上屏） ==")
         let controller = SettingsWindowController()
-        // Light, on white: the snapshot has no window background behind it.
-        controller.window?.appearance = NSAppearance(named: .aqua)
-        controller.refresh()
-        guard let grid = controller.grid, let content = controller.window?.contentView else { check("设置窗口建好", false); return }
-        content.setFrameSize(content.fittingSize)
-        content.layoutSubtreeIfNeeded()
-        var merged: [Int] = [], missing: [Int] = []
-        var frames: [(Int, CGRect)] = []
-        for i in 0..<grid.numberOfRows where !grid.row(at: i).isHidden {
-            let first = grid.cell(atColumnIndex: 0, rowIndex: i), second = grid.cell(atColumnIndex: 1, rowIndex: i)
-            if first.row === second.row, first.contentView === second.contentView { merged.append(i) }
-            for view in [first.contentView, second.contentView].compactMap({ $0 }) where view.superview != nil && view.frame.height > 0 {
-                frames.append((i, view.convert(view.bounds, to: content)))
-            }
-            if let view = second.contentView, view !== first.contentView, view.superview == nil || view.frame.width == 0 { missing.append(i) }
-        }
-        let headerRows = merged.compactMap { grid.cell(atColumnIndex: 0, rowIndex: $0).contentView as? NSTextField }.map(\.stringValue)
-        check("只有分区标题占两列：通用、保存、长截图、剪贴中转板", headerRows == ["通用", "保存", "长截图", "剪贴中转板"], headerRows.joined(separator: ","))
-        check("每一行右栏的内容都在", missing.isEmpty, "\(missing)")
-        let overlaps = frames.indices.flatMap { a in frames.indices.filter { $0 > a && frames[a].0 != frames[$0].0 && frames[a].1.insetBy(dx: 1, dy: 1).intersects(frames[$0].1.insetBy(dx: 1, dy: 1)) }.map { "\(frames[a].0)/\(frames[$0].0)" } }
-        check("各行互不重叠", overlaps.isEmpty, overlaps.joined(separator: " "))
-        let emptyRows = (0..<grid.numberOfRows).filter { i in
-            !grid.row(at: i).isHidden && (grid.cell(atColumnIndex: 1, rowIndex: i).contentView as? NSTextField)?.stringValue.isEmpty == true
-        }
-        check("空的提示行收起，不留空白", emptyRows.isEmpty, emptyRows.map { i in
-            "\(i): \((grid.cell(atColumnIndex: 0, rowIndex: max(i - 1, 0)).contentView as? NSTextField)?.stringValue ?? "?") 下面一行" }.joined(separator: ", "))
-        if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+        guard let window = controller.window, let content = window.contentView else { check("设置窗口建好", false); return }
+
+        let panes = SettingsWindowController.Pane.allCases
+        check("设置分为三类：通用、截图与录屏、剪贴中转板", panes.map(\.title) == ["通用", "截图与录屏", "剪贴中转板"])
+        let toolbarItems = window.toolbar?.items ?? []
+        check("工具栏图标全部可用", toolbarItems.count == panes.count && toolbarItems.allSatisfy { $0.image != nil })
+
+        func renderSnapshot(_ name: String, appearance: NSAppearance?) {
+            window.appearance = appearance
+            content.setFrameSize(CGSize(width: SettingsWindowController.windowWidth, height: content.fittingSize.height))
+            content.layoutSubtreeIfNeeded()
+            guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { return }
             content.cacheDisplay(in: content.bounds, to: rep)
-            if let shot = rep.cgImage, let ctx = CGContext(data: nil, width: shot.width, height: shot.height, bitsPerComponent: 8, bytesPerRow: 0,
-                                                           space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
-                ctx.setFillColor(.white)
-                ctx.fill(CGRect(x: 0, y: 0, width: shot.width, height: shot.height))
-                ctx.draw(shot, in: CGRect(x: 0, y: 0, width: shot.width, height: shot.height))
-                if let flat = ctx.makeImage() { try? ImageOutput.pngData(flat)?.write(to: dir.appendingPathComponent("60-settings.png")) }
+            guard let shot = rep.cgImage,
+                  let ctx = CGContext(data: nil, width: shot.width, height: shot.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            let eff = appearance ?? NSAppearance(named: .aqua)!
+            eff.performAsCurrentDrawingAppearance {
+                ctx.setFillColor(NSColor.windowBackgroundColor.cgColor)
             }
+            ctx.fill(CGRect(x: 0, y: 0, width: shot.width, height: shot.height))
+            ctx.draw(shot, in: CGRect(x: 0, y: 0, width: shot.width, height: shot.height))
+            if let flat = ctx.makeImage() { try? ImageOutput.pngData(flat)?.write(to: dir.appendingPathComponent(name)) }
         }
+
+        for pane in panes {
+            controller.selectPane(pane, animate: false)
+            window.appearance = NSAppearance(named: .aqua)
+            content.setFrameSize(CGSize(width: SettingsWindowController.windowWidth, height: content.fittingSize.height))
+            content.layoutSubtreeIfNeeded()
+
+            check("工具栏选中页签「\(pane.title)」", window.toolbar?.selectedItemIdentifier == pane.toolbarIdentifier)
+
+            let cards = controller.cards(for: pane)
+            check("「\(pane.title)」卡片非空", !cards.isEmpty)
+
+            var rowFrames: [(Int, CGRect)] = []
+            var badRows: [Int] = []
+            var emptyNotices: [Int] = []
+            for card in cards {
+                for row in card.rows where !row.isHidden {
+                    let rect = row.convert(row.bounds, to: content)
+                    if rect.width <= 0 || rect.height <= 0 || !content.bounds.insetBy(dx: -1, dy: -1).contains(rect) {
+                        badRows.append(rowFrames.count)
+                    }
+                    if let notice = row as? SettingsNoticeRow, notice.message.isEmpty {
+                        emptyNotices.append(rowFrames.count)
+                    }
+                    rowFrames.append((rowFrames.count, rect))
+                }
+            }
+            let overlaps = rowFrames.indices.flatMap { a in
+                rowFrames.indices.filter { $0 > a && rowFrames[a].1.insetBy(dx: 1, dy: 1).intersects(rowFrames[$0].1.insetBy(dx: 1, dy: 1)) }
+                    .map { "\(rowFrames[a].0)/\(rowFrames[$0].0)" }
+            }
+            check("「\(pane.title)」各设置行布局完整且未越界", badRows.isEmpty, "\(badRows)")
+            check("「\(pane.title)」各设置行互不重叠", overlaps.isEmpty, overlaps.joined(separator: " "))
+            check("「\(pane.title)」空提示行已收起", emptyNotices.isEmpty, "\(emptyNotices)")
+
+            renderSnapshot("60-settings-\(pane.rawValue)-light.png", appearance: NSAppearance(named: .aqua))
+            renderSnapshot("61-settings-\(pane.rawValue)-dark.png", appearance: NSAppearance(named: .darkAqua))
+        }
+
+        // 验证快捷键冲突提示展开后再收起时不重叠且不留空隙
+        controller.selectPane(.general, animate: false)
+        controller.setShortcutTaken(true)
+        let expandedHeight = content.fittingSize.height
+        controller.setShortcutTaken(false)
+        let collapsedHeight = content.fittingSize.height
+        check("快捷键冲突提示展开后正常增加高度，收起后恢复", expandedHeight > collapsedHeight, "\(expandedHeight) -> \(collapsedHeight)")
     }
 
     private func caseMenuBarIcon() {
