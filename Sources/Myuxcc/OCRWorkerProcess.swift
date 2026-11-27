@@ -11,6 +11,10 @@ final class OCRWorkerProcess {
     private var toWorker = Pipe()
     private var fromWorker = Pipe()
     private var buffer = Data()
+    /// 标记读取缓冲区是否曾超过阈值，用于在消费完大消息后收缩底层容量
+    private var bufferNeedsShrink = false
+    /// 行读取缓冲区收缩阈值（64 KB）
+    private static let maxRetainedBufferCapacity = 64 * 1024
     /// Set once the worker dies; it is restarted on the next request.
     private(set) var failed = false
 
@@ -42,7 +46,9 @@ final class OCRWorkerProcess {
         process.standardInput = toWorker
         process.standardOutput = fromWorker
         process.standardError = FileHandle.nullDevice
-        buffer.removeAll()
+        // 重建空 Data 彻底释放旧进程遗留的缓冲区容量
+        buffer = Data()
+        bufferNeedsShrink = false
         failed = false
         try process.run()
         NSLog("Myuxcc: started OCR worker pid \(process.processIdentifier)")
@@ -51,11 +57,14 @@ final class OCRWorkerProcess {
     /// Recognises `image`; throws on a worker error, a crash, a wedged worker, or a protocol surprise.
     func recognize(_ image: CGImage) throws -> [RecognizedLine] {
         try startIfNeeded()
-        guard let data = ImageOutput.pngData(image) else {
-            throw TextRecognizer.Failure.engineUnavailable("编码失败")
+        // 在局部 autoreleasepool 中完成 PNG 编码、Base64 序列化与管道写入，写完后立即释放临时大缓冲
+        try autoreleasepool {
+            guard let data = ImageOutput.pngData(image) else {
+                throw TextRecognizer.Failure.engineUnavailable("编码失败")
+            }
+            let header = "OCR \(image.width) \(image.height) \(data.base64EncodedString())\n"
+            toWorker.fileHandleForWriting.write(Data(header.utf8))
         }
-        let header = "OCR \(image.width) \(image.height) \(data.base64EncodedString())\n"
-        toWorker.fileHandleForWriting.write(Data(header.utf8))
 
         var lines: [RecognizedLine] = []
         let deadline = Date().addingTimeInterval(replyTimeout)
@@ -92,20 +101,39 @@ final class OCRWorkerProcess {
             if let newline = buffer.firstIndex(of: 0x0A) {
                 let line = String(data: buffer[buffer.startIndex..<newline], encoding: .utf8) ?? ""
                 buffer.removeSubrange(buffer.startIndex...newline)
+                // 处理完大消息后如缓冲已空或低于阈值，重建 Data 释放底层内存块
+                if buffer.isEmpty {
+                    if bufferNeedsShrink {
+                        buffer = Data()
+                        bufferNeedsShrink = false
+                    }
+                } else if bufferNeedsShrink, buffer.count <= Self.maxRetainedBufferCapacity {
+                    buffer = Data(buffer)
+                    bufferNeedsShrink = false
+                }
                 return line
             }
             guard Date() < deadline else { return nil }
             let handle = fromWorker.fileHandleForReading
             guard isReadable(handle, within: 0.2) else { continue }
-            let data = handle.availableData
+            // 在工作队列上包裹 autoreleasepool 及时回收 FileHandle.availableData 产生的临时 NSData
+            let data = autoreleasepool { handle.availableData }
             if data.isEmpty {
                 // End of file: the worker is gone.
-                guard !buffer.isEmpty else { return nil }
+                guard !buffer.isEmpty else {
+                    buffer = Data()
+                    bufferNeedsShrink = false
+                    return nil
+                }
                 let rest = String(data: buffer, encoding: .utf8)
-                buffer.removeAll()
+                buffer = Data()
+                bufferNeedsShrink = false
                 return rest
             }
             buffer.append(data)
+            if buffer.count > Self.maxRetainedBufferCapacity {
+                bufferNeedsShrink = true
+            }
         }
     }
 
@@ -121,6 +149,9 @@ final class OCRWorkerProcess {
         failed = true
         if process.isRunning { process.terminate() }
         try? toWorker.fileHandleForWriting.close()
+        // 停止子进程时同步释放行读取缓冲区容量
+        buffer = Data()
+        bufferNeedsShrink = false
         // 不要在已启动的 Process 上改 standardInput。terminate() 只是发送 SIGTERM，
         // 进程往往仍在运行，Foundation 会抛 NSInvalidArgumentException ("task already launched")；
         // Swift 捕获不到 ObjC 异常，会直接 abort 闪退（截图翻译走到 OCR worker 回退时必现）。
@@ -135,8 +166,11 @@ final class OCRWorkerProcess {
             NSLog("Myuxcc: could not start the OCR worker: \(error)")
             return
         }
-        guard let image = Self.warmUpImage() else { return }
-        _ = try? recognize(image)
+        // 在 autoreleasepool 中生成预热图并完成首次识别，避免预热阶段 NSFont/NSAttributedString 滞留
+        autoreleasepool {
+            guard let image = Self.warmUpImage() else { return }
+            _ = try? recognize(image)
+        }
     }
 
     /// A small image with text in both languages, so the Chinese and Latin models both get loaded.

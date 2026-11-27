@@ -39,7 +39,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     private var draft: Annotation?
     private var color: NSColor { StyleBarView.colors[MarkStyle.colorIndex].color }
     private var lineWidth: CGFloat { MarkStyle.shapeWidths[MarkStyle.sizeIndex] }
-    private var textSize: CGFloat { MarkStyle.textSizes[MarkStyle.sizeIndex] }
+    private var textSize: CGFloat { CGFloat(MarkStyle.textSize) }
     private var highlighterColor: NSColor {
         StyleBarView.colors[MarkStyle.highlighterColorIndex].color.withAlphaComponent(MarkStyle.highlighterAlpha)
     }
@@ -181,6 +181,19 @@ final class OverlayView: NSView, NSTextFieldDelegate {
 
     // MARK: - Drawing
 
+    /// 截图选区与窗口悬停高亮框的统一线宽（参考微信截图加厚至 3.4pt，醒目利落）
+    static let selectionBorderWidth: CGFloat = 3.4
+
+    /// 计算选区/悬停外框路径矩形：默认紧贴选区外侧描边，贴近屏幕边缘时向内钳制以防被屏幕边界裁切
+    private func selectionBorderRect(for rect: CGRect) -> CGRect {
+        let half = Self.selectionBorderWidth / 2 // 半线宽偏移量，使描边内沿恰好贴齐选区边缘
+        let minX = max(rect.minX - half, half)
+        let minY = max(rect.minY - half, half)
+        let maxX = min(rect.maxX + half, bounds.maxX - half)
+        let maxY = min(rect.maxY + half, bounds.maxY - half)
+        return CGRect(x: minX, y: minY, width: max(0, maxX - minX), height: max(0, maxY - minY))
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if isLongCapture { drawLongCaptureFrame(); return }
@@ -198,9 +211,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         guard let sel = selection else {
             if let hover = hoverRect {
                 NSColor.systemBlue.setStroke()
-                // 加粗悬停高亮框线宽，使窗口吸附预览边框更醒目清晰
-                let border = NSBezierPath(rect: hover.insetBy(dx: 1.25, dy: 1.25))
-                border.lineWidth = 2.5
+                // 使用统一的 3.4pt 边框并防屏幕边缘裁切，使窗口吸附预览边框更醒目清晰
+                let border = NSBezierPath(rect: selectionBorderRect(for: hover))
+                border.lineWidth = Self.selectionBorderWidth
                 border.stroke()
                 drawSizeLabel(for: hover)
             }
@@ -215,20 +228,22 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         NSGraphicsContext.restoreGraphicsState()
 
         NSColor.systemBlue.setStroke()
-        // 将截图选区边框从 1pt 加粗至 2.2pt，解决原先选区框过细、在复杂背景上不够明显的问题
-        let border = NSBezierPath(rect: sel.insetBy(dx: -1.1, dy: -1.1))
-        border.lineWidth = 2.2
+        // 将截图选区边框加厚至 3.4pt（看齐图一），在复杂背景下边界清晰利落
+        let border = NSBezierPath(rect: selectionBorderRect(for: sel))
+        border.lineWidth = Self.selectionBorderWidth
         border.stroke()
 
         if currentTool == nil {
             for h in Handle.allCases {
                 let r = handleRect(h, in: sel)
+                // 保持命中区域 8×8pt 不变，仅在视觉上外扩 0.75pt（9.5×9.5pt）以匹配加厚后的选区边框
+                let visualRect = r.insetBy(dx: -0.75, dy: -0.75)
                 NSColor.white.setFill()
-                let oval = NSBezierPath(ovalIn: r)
+                let oval = NSBezierPath(ovalIn: visualRect)
                 oval.fill()
                 NSColor.systemBlue.setStroke()
-                // 同步加粗选区控制点描边，与加粗后的选区外框保持视觉协调
-                oval.lineWidth = 1.5
+                // 同步加粗选区控制点描边至 2.0pt，与 3.4pt 选区外框视觉协调
+                oval.lineWidth = 2.0
                 oval.stroke()
             }
         }
@@ -251,8 +266,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         NSColor.black.withAlphaComponent(0.4).setFill()
         dim.fill()
         NSColor.systemBlue.setStroke()
-        let border = NSBezierPath(rect: sel.insetBy(dx: -1.25, dy: -1.25))
-        border.lineWidth = 2.5
+        // 长截图锁定框同样采用 3.4pt 统一线宽，进入长截图前后边框粗细保持一致
+        let border = NSBezierPath(rect: selectionBorderRect(for: sel))
+        border.lineWidth = Self.selectionBorderWidth
         border.stroke()
     }
 
@@ -481,6 +497,10 @@ final class OverlayView: NSView, NSTextFieldDelegate {
 
         styleBar.isHidden = styleTarget == nil
         guard let target = styleTarget else { return }
+        // 先切换样式条模式（粗细圆点 vs 字号加减），再读取 fittingSize 以免面板宽度滞后
+        styleBar.update(colorIndex: target == .highlighter ? MarkStyle.highlighterColorIndex : MarkStyle.colorIndex,
+                        sizeIndex: MarkStyle.sizeIndex,
+                        textSize: target == .text ? activeTextSize : nil)
         // Right against the toolbar, left edges aligned under the tools: on the side away from the
         // selection, or the other side when the screen edge leaves no room there.
         let barSize = styleBar.fittingSize
@@ -489,32 +509,45 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         let barY = toolbarPlacement == .below ? (fitsUnder || !fitsOver ? under : over) : (fitsOver || !fitsUnder ? over : under)
         let barX = min(max(toolbar.frame.minX, margin), bounds.width - barSize.width - margin)
         styleBar.frame = CGRect(x: barX, y: barY, width: barSize.width, height: barSize.height)
-        styleBar.update(colorIndex: target == .highlighter ? MarkStyle.highlighterColorIndex : MarkStyle.colorIndex,
-                        sizeIndex: MarkStyle.sizeIndex)
     }
 
     enum ToolbarPlacement { case below, above, inside }
     /// Where the toolbar sits relative to the selection; the size label moves inside when the toolbar takes the space above.
     private(set) var toolbarPlacement = ToolbarPlacement.below
 
-    private enum StyleTarget { case marks, highlighter }
+    private enum StyleTarget { case marks, highlighter, text }
 
     /// What the style bar would change: the selected mark, the text being typed or the current tool; nil for the mosaic.
     private var styleTarget: StyleTarget? {
         if let i = selectedAnnotation, annotations.indices.contains(i) {
             if case .mosaic = annotations[i] { return nil }
+            if annotations[i].isText { return .text }
             return annotations[i].isHighlighter ? .highlighter : .marks
         }
-        if editingField != nil { return .marks }
+        if editingField != nil { return .text }
         switch currentTool {
         case nil, .mosaic?: return nil
         case .highlighter?: return .highlighter
+        case .text?: return .text
         default: return .marks
         }
     }
 
+    /// 当前样式条应显示的字号（优先读取选中文字标注或正在输入的文本框，否则取全局记忆字号）
+    private var activeTextSize: Int {
+        if let i = selectedAnnotation, annotations.indices.contains(i),
+           case let .text(_, _, _, size) = annotations[i] {
+            return Int(size.rounded())
+        }
+        if let field = editingField {
+            return Int((reeditedText?.size ?? field.font?.pointSize ?? textSize).rounded())
+        }
+        return MarkStyle.textSize
+    }
+
     @objc func pickColor(_ sender: NSButton) { applyStyle(colorIndex: sender.tag, sizeIndex: nil) }
     @objc func pickSize(_ sender: NSButton) { applyStyle(colorIndex: nil, sizeIndex: sender.tag) }
+    @objc func adjustTextSize(_ sender: NSButton) { applyTextSizeDelta(sender.tag) }
 
     /// Sets the style for the next marks and restyles the selected mark (undoably) or the text being typed.
     private func applyStyle(colorIndex: Int?, sizeIndex: Int?) {
@@ -530,12 +563,31 @@ final class OverlayView: NSView, NSTextFieldDelegate {
             recordUndo()
             annotations[i] = annotations[i].restyled(color: newColor, sizeIndex: sizeIndex)
         } else if let field = editingField {
-            if let newColor { field.textColor = newColor }
-            if sizeIndex != nil {
-                field.font = Annotation.textFont(textSize)
-                reeditedText?.size = textSize
+            if let newColor {
+                field.textColor = newColor
+                reeditedText?.color = newColor
             }
-            if let newColor { reeditedText?.color = newColor }
+        }
+        layoutToolbar()
+        needsDisplay = true
+    }
+
+    /// 按步长增减文字字号，并实时同步到全局记忆字号、选中的文字标注或正在输入的文本框
+    private func applyTextSizeDelta(_ delta: Int) {
+        finishActiveDrag()
+        guard styleTarget == .text else { return }
+        let current = activeTextSize
+        let next = min(max(current + delta, MarkStyle.minTextSize), MarkStyle.maxTextSize)
+        guard next != current else { return }
+        MarkStyle.textSize = next
+        let cgSize = CGFloat(next)
+        if let i = selectedAnnotation, annotations.indices.contains(i), annotations[i].isText {
+            recordUndo()
+            annotations[i] = annotations[i].restyled(color: nil, textSize: cgSize)
+        } else if let field = editingField {
+            field.font = Annotation.textFont(cgSize)
+            field.frame.size.height = Self.textFieldHeight(for: cgSize)
+            reeditedText?.size = cgSize
         }
         layoutToolbar()
         needsDisplay = true
@@ -1062,6 +1114,11 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         needsDisplay = true
     }
 
+    private static func textFieldHeight(for size: CGFloat) -> CGFloat {
+        // 按字号自适应输入框高度，避免调大字号时文字在输入态被垂直裁切
+        max(28, ceil(size * 1.45) + 6)
+    }
+
     private func beginTextEditing(fieldOrigin: CGPoint, text: String, color: NSColor, size: CGFloat) {
         let field = NSTextField(string: text)
         field.font = Annotation.textFont(size)
@@ -1072,10 +1129,12 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         field.placeholderString = "输入文字"
         field.delegate = self
         field.frame = CGRect(x: fieldOrigin.x, y: fieldOrigin.y,
-                             width: max(120, (selection?.maxX ?? fieldOrigin.x) - fieldOrigin.x), height: 28)
+                             width: max(120, (selection?.maxX ?? fieldOrigin.x) - fieldOrigin.x),
+                             height: Self.textFieldHeight(for: size))
         addSubview(field)
         window?.makeFirstResponder(field)
         editingField = field
+        layoutToolbar()
     }
 
     private func commitTextEditing() {

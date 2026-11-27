@@ -17,6 +17,12 @@ final class StyleBarView: NSVisualEffectView {
 
     private(set) var colorButtons: [NSButton] = []
     private(set) var sizeButtons: [NSButton] = []
+    /// 文字工具专用的字号减小/增大按钮与当前字号数字标签
+    private(set) var textSizeDecreaseButton: NSButton!
+    private(set) var textSizeIncreaseButton: NSButton!
+    private(set) var textSizeLabel: NSTextField!
+    private let sizeGroup = NSStackView()
+    private let textSizeGroup = NSStackView()
 
     init(target: OverlayView) {
         super.init(frame: .zero)
@@ -24,7 +30,9 @@ final class StyleBarView: NSVisualEffectView {
         blendingMode = .withinWindow
         state = .active
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = 7 // 与主工具栏保持统一利落圆角
+        layer?.borderWidth = 1 // 细微高光描边，确保深色背景下边缘清晰
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
 
         let stack = NSStackView()
         stack.orientation = .horizontal
@@ -48,12 +56,40 @@ final class StyleBarView: NSVisualEffectView {
         separator.widthAnchor.constraint(equalToConstant: 1).isActive = true
         separator.heightAnchor.constraint(equalToConstant: 18).isActive = true
         stack.addArrangedSubview(separator)
+
+        // 图形/画笔/荧光笔使用的三档粗细圆点组
+        sizeGroup.orientation = .horizontal
+        sizeGroup.spacing = 4
         for (i, name) in Self.sizeNames.enumerated() {
             // 与加粗后的三档标注线宽对应，圆点直径同步微调为 5 / 8 / 12 pt
             let b = Self.button(Self.dot(diameter: [5, 8, 12][i]), name, target, #selector(OverlayView.pickSize(_:)), tag: i)
             sizeButtons.append(b)
-            stack.addArrangedSubview(b)
+            sizeGroup.addArrangedSubview(b)
         }
+        stack.addArrangedSubview(sizeGroup)
+
+        // 文字工具专用的「− 字号数字 +」调节组（默认隐藏，选中文字工具或文字标注时切换显示）
+        textSizeGroup.orientation = .horizontal
+        textSizeGroup.spacing = 2
+        textSizeGroup.alignment = .centerY
+        textSizeDecreaseButton = Self.button(Self.stepperSymbol(plus: false), "减小字号", target,
+                                             #selector(OverlayView.adjustTextSize(_:)), tag: -MarkStyle.textSizeStep)
+        textSizeDecreaseButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        textSizeLabel = NSTextField(labelWithString: "\(MarkStyle.defaultTextSize)")
+        textSizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        textSizeLabel.textColor = .labelColor
+        textSizeLabel.alignment = .center
+        textSizeLabel.lineBreakMode = .byClipping
+        textSizeLabel.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        textSizeIncreaseButton = Self.button(Self.stepperSymbol(plus: true), "增大字号", target,
+                                             #selector(OverlayView.adjustTextSize(_:)), tag: MarkStyle.textSizeStep)
+        textSizeIncreaseButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        textSizeGroup.addArrangedSubview(textSizeDecreaseButton)
+        textSizeGroup.addArrangedSubview(textSizeLabel)
+        textSizeGroup.addArrangedSubview(textSizeIncreaseButton)
+        textSizeGroup.isHidden = true
+        stack.addArrangedSubview(textSizeGroup)
+
         frame.size = fittingSize
     }
 
@@ -61,11 +97,24 @@ final class StyleBarView: NSVisualEffectView {
 
     /// Marks the current colour and size with a light rounded backing, the same for both groups.
     /// Not with a colour: next to the palette a tinted size button would read as "blue".
-    func update(colorIndex: Int, sizeIndex: Int) {
+    /// 当 `textSize` 非空时切换为文字字号加减模式，否则展示三档粗细圆点。
+    func update(colorIndex: Int, sizeIndex: Int, textSize: Int? = nil) {
         for (i, b) in colorButtons.enumerated() { Self.mark(b, selected: i == colorIndex) }
-        for (i, b) in sizeButtons.enumerated() {
-            b.state = i == sizeIndex ? .on : .off
-            Self.mark(b, selected: i == sizeIndex)
+        if let textSize {
+            sizeGroup.isHidden = true
+            textSizeGroup.isHidden = false
+            textSizeLabel.stringValue = "\(textSize)"
+            textSizeDecreaseButton.isEnabled = textSize > MarkStyle.minTextSize
+            textSizeIncreaseButton.isEnabled = textSize < MarkStyle.maxTextSize
+            textSizeDecreaseButton.alphaValue = textSizeDecreaseButton.isEnabled ? 1 : 0.35
+            textSizeIncreaseButton.alphaValue = textSizeIncreaseButton.isEnabled ? 1 : 0.35
+        } else {
+            sizeGroup.isHidden = false
+            textSizeGroup.isHidden = true
+            for (i, b) in sizeButtons.enumerated() {
+                b.state = i == sizeIndex ? .on : .off
+                Self.mark(b, selected: i == sizeIndex)
+            }
         }
     }
 
@@ -113,6 +162,28 @@ final class StyleBarView: NSVisualEffectView {
         image.isTemplate = true // tinted like the toolbar's symbols
         return image
     }
+
+    /// 绘制字号调节用的居中「−」或「+」模板矢量图标，保证在 HUD 样式条中清晰锐利
+    private static func stepperSymbol(plus: Bool) -> NSImage {
+        let image = NSImage(size: CGSize(width: 16, height: 16), flipped: false) { _ in
+            NSColor.black.setStroke()
+            let path = NSBezierPath()
+            path.lineWidth = 1.6
+            path.lineCapStyle = .round
+            // 水平横线（减号与加号共用）
+            path.move(to: CGPoint(x: 4, y: 8))
+            path.line(to: CGPoint(x: 12, y: 8))
+            if plus {
+                // 垂直竖线（组成加号）
+                path.move(to: CGPoint(x: 8, y: 4))
+                path.line(to: CGPoint(x: 8, y: 12))
+            }
+            path.stroke()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
 }
 
 /// Reacts to the first click even when the overlay is not yet the key window.
@@ -125,7 +196,11 @@ enum MarkStyle {
     /// 细 / 中 / 粗三档标注线宽（由原先 [2, 3, 6] 适度加粗至 [3, 4.5, 7.5]，让截图标注框更加醒目饱满）
     static let shapeWidths: [CGFloat] = [3, 4.5, 7.5]
     static let highlighterWidths: [CGFloat] = [10, 16, 24]
-    static let textSizes: [CGFloat] = [14, 20, 30]
+    /// 文字标注字号的默认值、合法范围与每次点击加减的步长（pt）
+    static let defaultTextSize = 20
+    static let minTextSize = 10
+    static let maxTextSize = 72
+    static let textSizeStep = 2
     static let highlighterAlpha: CGFloat = 0.4
 
     /// Set by the silent e2e test, so picking styles there leaves the user's saved choice alone.
@@ -143,6 +218,16 @@ enum MarkStyle {
     static var sizeIndex: Int {
         get { stored("markSize", default: 1) }
         set { store(newValue, "markSize") }
+    }
+    /// 跨截图记忆的文字标注字号（独立于图形粗细三档）
+    static var textSize: Int {
+        get {
+            let raw = inMemory.map { $0["markTextSize"] ?? defaultTextSize }
+                ?? (UserDefaults.standard.object(forKey: "markTextSize") != nil
+                    ? UserDefaults.standard.integer(forKey: "markTextSize") : defaultTextSize)
+            return min(max(raw, minTextSize), maxTextSize)
+        }
+        set { store(min(max(newValue, minTextSize), maxTextSize), "markTextSize") }
     }
 
     private static func stored(_ key: String, default value: Int) -> Int {
@@ -164,8 +249,8 @@ extension Annotation {
         return false
     }
 
-    /// The same mark in another palette colour and/or size step; the mosaic has neither.
-    func restyled(color: NSColor?, sizeIndex: Int?) -> Annotation {
+    /// The same mark in another palette colour and/or size step (or explicit text font size); the mosaic has neither.
+    func restyled(color: NSColor?, sizeIndex: Int? = nil, textSize: CGFloat? = nil) -> Annotation {
         switch self {
         case let .rectangle(r, c, w): return .rectangle(r, color ?? c, sizeIndex.map { MarkStyle.shapeWidths[$0] } ?? w)
         case let .ellipse(r, c, w): return .ellipse(r, color ?? c, sizeIndex.map { MarkStyle.shapeWidths[$0] } ?? w)
@@ -176,7 +261,7 @@ extension Annotation {
                             sizeIndex.map { MarkStyle.highlighterWidths[$0] } ?? w)
             }
             return .pen(points, color ?? c, sizeIndex.map { MarkStyle.shapeWidths[$0] } ?? w)
-        case let .text(s, origin, c, size): return .text(s, origin, color ?? c, sizeIndex.map { MarkStyle.textSizes[$0] } ?? size)
+        case let .text(s, origin, c, size): return .text(s, origin, color ?? c, textSize ?? size)
         case .mosaic: return self
         }
     }

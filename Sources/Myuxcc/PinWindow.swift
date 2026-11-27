@@ -33,6 +33,14 @@ final class PinWindowController: NSObject, NSWindowDelegate {
     /// Where the status line ended up, for the e2e test to check it is outside the image.
     var statusFrame: CGRect? { statusPanel?.frame }
     private var statusHide: DispatchWorkItem?
+    /// 缓存原图与译图对应的 NSImage 包装，避免切换显示时重复创建大图像包装对象
+    private var originalNSImage: NSImage?
+    private var translatedNSImage: NSImage?
+    /// 在途 OCR 与图片翻译任务句柄，关闭窗口时主动取消并释放引用
+    private var recognitionTask: Task<Void, Never>?
+    private var translationTask: Task<Void, Never>?
+    /// 防止 windowWillClose 与 close() 重复清理的幂等标记
+    private var isClosed = false
 
     /// With `translating` the pin first shows the screenshot, then the translation drawn over it.
     /// With `recognizing` the pin stays in place over the original image and lets the user
@@ -71,7 +79,10 @@ final class PinWindowController: NSObject, NSWindowDelegate {
         window.acceptsMouseMovedEvents = true
         window.delegate = self
 
-        view.image = NSImage(cgImage: image, size: pointSize)
+        // 缓存初始原图对应的 NSImage 包装，后续切换回原文时可直接复用
+        let initialImage = NSImage(cgImage: image, size: pointSize)
+        originalNSImage = initialImage
+        view.image = initialImage
         view.imageScaling = .scaleAxesIndependently
         view.wantsLayer = true
         // Subtle inner highlight rim so the sticker edge is crisp against same-colour backgrounds.
@@ -144,29 +155,37 @@ final class PinWindowController: NSObject, NSWindowDelegate {
     /// directly over the original image, similar to how translation pins directly in place.
     @objc func recognizeText() {
         MainActor.assumeIsolated {
-            guard !recognitionRunning else { return }
+            guard !isClosed, !recognitionRunning else { return }
             recognitionRunning = true
             recognitionFailure = nil
             let targetImage = image
             showStatus("正在识别文字…")
             let started = Date()
-            Task { @MainActor in
+            recognitionTask?.cancel()
+            // 使用弱引用并保存任务句柄，关闭窗口时可及时取消并防止回调重建状态条
+            recognitionTask = Task { @MainActor [weak self] in
                 do {
                     let lines = try await TextRecognizer.recognize(targetImage)
-                    recognizedLines = lines
-                    view.setRecognizedLines(lines)
+                    guard !Task.isCancelled, let self, !self.isClosed else { return }
+                    self.recognizedLines = lines
+                    self.view.setRecognizedLines(lines)
                     let elapsed = Date().timeIntervalSince(started)
                     if lines.isEmpty {
-                        showStatus("未识别到文字", for: 2.5)
+                        self.showStatus("未识别到文字", for: 2.5)
                     } else {
-                        showStatus(String(format: "已识别 %d 行 (%.1f秒) · 直接拖拽选字 · ⌘C 复制 · ⌘A 全选", lines.count, elapsed), for: 3.5)
+                        self.showStatus(String(format: "已识别 %d 行 (%.1f秒) · 直接拖拽选字 · ⌘C 复制 · ⌘A 全选", lines.count, elapsed), for: 3.5)
                     }
+                } catch is CancellationError {
+                    return
                 } catch {
-                    recognitionFailure = error.localizedDescription
-                    showStatus(nil)
+                    guard !Task.isCancelled, let self, !self.isClosed else { return }
+                    self.recognitionFailure = error.localizedDescription
+                    self.showStatus(nil)
                     if Self.testPresenter == nil { Toast.show("识别失败：\(error.localizedDescription)") }
                 }
-                recognitionRunning = false
+                guard !Task.isCancelled, let self, !self.isClosed else { return }
+                self.recognitionRunning = false
+                self.recognitionTask = nil
             }
         }
     }
@@ -205,31 +224,50 @@ final class PinWindowController: NSObject, NSWindowDelegate {
     /// Draws the translation over the screenshot, or switches between it and the original once done.
     @objc func translate() {
         MainActor.assumeIsolated {
+            guard !isClosed else { return }
             if translated != nil { showTranslation(!showingTranslation); return }
             guard !translationRunning else { return }
             translationRunning = true
             translationFailure = nil
             showStatus("正在翻译…")
             let started = Date()
-            Task { @MainActor in
+            let sourceImage = original
+            translationTask?.cancel()
+            // 使用弱引用并保存任务句柄，窗口关闭时可取消在途图片翻译并释放原图引用
+            translationTask = Task { @MainActor [weak self] in
                 do {
-                    let (image, pair) = try await ImageTranslator.translate(original, target: ScreenTranslator.target)
-                    translated = image
-                    showTranslation(true)
-                    showStatus(String(format: "%@ · %.1f 秒 · T 切换原文", pair, Date().timeIntervalSince(started)), for: 2.5)
+                    let (image, pair) = try await ImageTranslator.translate(sourceImage, target: ScreenTranslator.target)
+                    guard !Task.isCancelled, let self, !self.isClosed else { return }
+                    self.translated = image
+                    self.showTranslation(true)
+                    self.showStatus(String(format: "%@ · %.1f 秒 · T 切换原文", pair, Date().timeIntervalSince(started)), for: 2.5)
+                } catch is CancellationError {
+                    return
                 } catch {
-                    translationFailure = error.localizedDescription
-                    showStatus(nil)
+                    guard !Task.isCancelled, let self, !self.isClosed else { return }
+                    self.translationFailure = error.localizedDescription
+                    self.showStatus(nil)
                     if Self.testPresenter == nil { Toast.show("翻译失败：\(error.localizedDescription)") }
                 }
-                translationRunning = false
+                guard !Task.isCancelled, let self, !self.isClosed else { return }
+                self.translationRunning = false
+                self.translationTask = nil
             }
         }
     }
 
     @MainActor func showTranslation(_ on: Bool) {
         showingTranslation = on && translated != nil
-        view.image = NSImage(cgImage: image, size: baseSize)
+        if showingTranslation, let translated {
+            // 首次显示译图时缓存 NSImage，后续按 T 来回切换直接复用而不重复包装
+            let nsImage = translatedNSImage ?? NSImage(cgImage: translated, size: baseSize)
+            translatedNSImage = nsImage
+            view.image = nsImage
+        } else {
+            let nsImage = originalNSImage ?? NSImage(cgImage: original, size: baseSize)
+            originalNSImage = nsImage
+            view.image = nsImage
+        }
         view.needsDisplay = true
     }
 
@@ -239,11 +277,17 @@ final class PinWindowController: NSObject, NSWindowDelegate {
         statusHide?.cancel()
         statusHide = nil
         guard let text else {
-            statusPanel?.orderOut(nil)
+            if let panel = statusPanel {
+                // 隐藏状态条时同步拆离视图并关闭面板，避免残留底层窗口缓冲
+                panel.orderOut(nil)
+                panel.contentView = nil
+                panel.close()
+            }
             statusPanel = nil
             statusText = nil
             return
         }
+        guard !isClosed else { return }
         statusText = text
         let label = statusPanel?.contentView?.subviews.first as? NSTextField ?? NSTextField(labelWithString: "")
         label.stringValue = text
@@ -265,6 +309,8 @@ final class PinWindowController: NSObject, NSWindowDelegate {
             panel.level = .floating
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             panel.animationBehavior = .none
+            // 显式关闭 isReleasedWhenClosed，配合 ARC 安全调用 close()
+            panel.isReleasedWhenClosed = false
             let background = NSView(frame: CGRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
             background.wantsLayer = true
             background.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
@@ -299,19 +345,47 @@ final class PinWindowController: NSObject, NSWindowDelegate {
 
     @objc func saveImage() { ImageOutput.save(image) }
     @objc func resetZoom() { zoom = 1; zoom(by: 0) }
-    @objc func close() { window.close() }
+    @objc func close() {
+        window.close()
+        // 无界面测试（窗口未上屏）下 windowWillClose 可能不触发，这里在主线程上兜底执行统一清理
+        MainActor.assumeIsolated { cleanup() }
+    }
 
     func windowWillClose(_ notification: Notification) {
+        MainActor.assumeIsolated { cleanup() }
+    }
+
+    /// 统一清理贴图窗口资源：取消异步任务、关闭阴影/状态附属面板、拆离主视图并释放图像缓存
+    @MainActor private func cleanup() {
+        guard !isClosed else { return }
+        isClosed = true
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        translationTask?.cancel()
+        translationTask = nil
+        recognitionRunning = false
+        translationRunning = false
         showStatus(nil)
         if let shadowPanel {
+            // 解绑子窗口并彻底清空其内容视图与关闭面板，释放光晕阴影离屏缓冲
             window.removeChildWindow(shadowPanel)
             shadowPanel.orderOut(nil)
+            shadowPanel.contentView = nil
+            shadowPanel.close()
             self.shadowPanel = nil
         }
-        // 关闭贴图窗口时显式释放视图图像、译文合成大图与 OCR 文本布局缓存，防止贴图大位图滞留内存
+        // 关闭贴图窗口时显式释放视图图像、图层内容、译文合成大图与 OCR 文本布局缓存
         view.image = nil
+        view.layer?.contents = nil
         view.setRecognizedLines([])
         view.controller = nil
+        window.orderOut(nil)
+        window.makeFirstResponder(nil)
+        window.initialFirstResponder = nil
+        window.contentView = nil
+        window.delegate = nil
+        originalNSImage = nil
+        translatedNSImage = nil
         translated = nil
         recognizedLines = nil
         PinWindowController.open.removeAll { $0 === self }

@@ -645,10 +645,13 @@ final class E2ETest {
         func digit(_ n: Int) async { await key(window, code: [18, 19, 20, 21, 23, 22, 26, 28, 25][n - 1], chars: "\(n)") }
         await digit(1)
         check("按 1 选中第一个工具（矩形）", on() == [1], "\(on())")
+        // 校验画笔与箭头已交换位置：3 对应画笔，4 对应箭头
         await digit(3)
-        check("按 3 换成第三个工具（箭头）", on() == [3], "\(on())")
-        await digit(3)
-        check("再按 3 取消工具", on().isEmpty, "\(on())")
+        check("按 3 换成第三个工具（画笔）", on() == [3], "\(on())")
+        await digit(4)
+        check("按 4 换成第四个工具（箭头）", on() == [4], "\(on())")
+        await digit(4)
+        check("再按 4 取消工具", on().isEmpty, "\(on())")
         await digit(1)
         await drag(window, from: CGPoint(x: 350, y: 350), to: CGPoint(x: 450, y: 420))
         let drawn = buttons[7].isEnabled
@@ -719,6 +722,36 @@ final class E2ETest {
         } else {
             check("画出荧光笔", false)
         }
+        // 文字工具切换到字号数字与加减按钮（不显示粗细圆点）
+        await clickToolbarButton(window, view, tooltip: "文字")
+        check("文字工具显示字号调节而非粗细圆点",
+              !view.styleBar.isHidden
+              && view.styleBar.textSizeLabel.stringValue == "\(MarkStyle.defaultTextSize)"
+              && view.styleBar.sizeButtons.allSatisfy { $0.isHiddenOrHasHiddenAncestor }
+              && !view.styleBar.textSizeIncreaseButton.isHiddenOrHasHiddenAncestor)
+        await clickButton(window, view.styleBar.textSizeIncreaseButton, "增大字号")
+        let raisedSize = MarkStyle.defaultTextSize + MarkStyle.textSizeStep
+        check("点击加号后字号递增", view.styleBar.textSizeLabel.stringValue == "\(raisedSize)" && MarkStyle.textSize == raisedSize,
+              view.styleBar.textSizeLabel.stringValue)
+        await click(window, at: CGPoint(x: 320, y: 420))
+        if let editor = window.firstResponder as? NSTextView { editor.insertText("字号测试", replacementRange: NSRange(location: 0, length: 0)) }
+        await key(window, code: 36, chars: "\r")
+        if case let .text(_, _, _, sz)? = view.annotations.last {
+            check("新建文字采用当前字号", sz == CGFloat(raisedSize), "\(sz)")
+        } else {
+            check("提交文字标注", false)
+        }
+        await clickButton(window, view.styleBar.textSizeDecreaseButton, "减小字号")
+        if case let .text(_, _, _, sz)? = view.annotations.last {
+            check("选中文字后点击减号实时缩小字号",
+                  sz == CGFloat(MarkStyle.defaultTextSize) && view.styleBar.textSizeLabel.stringValue == "\(MarkStyle.defaultTextSize)",
+                  "\(sz)")
+        }
+        await key(window, code: 6, chars: "z", flags: .command)
+        if case let .text(_, _, _, sz)? = view.annotations.last {
+            check("⌘Z 撤销改字号", sz == CGFloat(raisedSize), "\(sz)")
+        }
+
         await clickToolbarButton(window, view, tooltip: "马赛克")
         check("马赛克不显示样式条", view.styleBar.isHidden)
         await key(window, code: 53, chars: "\u{1b}")

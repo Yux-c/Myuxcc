@@ -134,6 +134,8 @@ enum SelfTest {
         NSColor(srgbRed: 0.14, green: 0.14, blue: 0.16, alpha: 1).setFill()
         NSBezierPath(roundedRect: CGRect(x: 2, y: 2, width: totalW - 4, height: h - 4), xRadius: 12, yRadius: 12).fill()
 
+        // 校验工具栏中「画笔」与「箭头」已交换位置（第 3 位为画笔、第 4 位为箭头）
+        let orderOK = Tool.allCases == [.rectangle, .ellipse, .pen, .arrow, .highlighter, .text, .mosaic]
         var allNonEmpty = true
         for (i, kind) in kinds.enumerated() {
             let icon = ToolbarView.icon(for: kind)
@@ -142,8 +144,8 @@ enum SelfTest {
             // 在单独小画布中渲染模板图标并着色为白色（取消/完成分别着红/绿色）
             let tint: NSColor
             switch kind {
-            case .cancel: tint = NSColor(srgbRed: 1.0, green: 0.36, blue: 0.34, alpha: 1)
-            case .done: tint = NSColor(srgbRed: 0.22, green: 0.84, blue: 0.44, alpha: 1)
+            case .cancel: tint = NSColor(srgbRed: 1.0, green: 0.35, blue: 0.33, alpha: 1)
+            case .done: tint = NSColor(srgbRed: 0.16, green: 0.82, blue: 0.44, alpha: 1)
             default: tint = .white
             }
             let tinted = NSImage(size: icon.size, flipped: false) { r in
@@ -159,8 +161,9 @@ enum SelfTest {
         if let cg = ctx.makeImage(), let data = ImageOutput.pngData(cg) {
             try? data.write(to: URL(fileURLWithPath: "/tmp/myuxcc-toolbar-preview.png"))
         }
-        print("selftest: toolbar icons \(allNonEmpty ? "OK" : "FAILED") (\(kinds.count) icons)")
-        return allNonEmpty
+        let pass = allNonEmpty && orderOK
+        print("selftest: toolbar icons \(pass ? "OK" : "FAILED") (\(kinds.count) icons, orderOK=\(orderOK))")
+        return pass
     }
 
     /// Scrolls a synthetic document under a window with a sticky header and footer, including a jump

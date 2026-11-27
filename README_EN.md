@@ -24,7 +24,7 @@ Built purely with `Swift`, `AppKit`, `ScreenCaptureKit`, `Vision`, and `Translat
 | Module | Highlights |
 |---|---|
 | **Instant Capture** | Freeze all displays instantly via global hotkey (default `⌃A`); smart window snapping, 11×11 pixel loupe with sRGB color picker (press `C` to copy hex), and 8-handle selection resizing |
-| **Rich Annotations** | Rectangle, Ellipse, Arrow, Pen (with automatic straight-line snapping for hand-drawn lines), Highlighter, Text, and Mosaic; 8 colors, 3 stroke weights, PowerPoint-style selection/move/resize, undo/redo (`⌘Z` / `⇧⌘Z`), and number keys `1`–`9` |
+| **Rich Annotations** | Rectangle, Ellipse, Pen (with automatic straight-line snapping for hand-drawn lines), Arrow, Highlighter, Text, and Mosaic; 8 colors, 3 stroke weights, dedicated numeric font size stepper (`−` / `+`) for text, PowerPoint-style selection/move/resize, undo/redo (`⌘Z` / `⇧⌘Z`), and number keys `1`–`9` |
 | **Scrolling Long Capture** | Lock a region and scroll vertically (up or down) to stitch long pages in real time; automatically strips sticky headers, footers, fixed sidebars, and floating buttons with live preview |
 | **Offline OCR** | Powered by macOS Vision framework for fast on-device Chinese & English text recognition; drag to select characters directly over the original image, double-click words, triple-click lines, and copy with `⌘C` |
 | **Image Translation** | Powered by macOS Translation framework for on-device translation (requires macOS 26+); supports **in-place overlay translation** (samples background & foreground colors and renders translated text in place; press `T` to toggle original/translated) and **side-by-side text translation** |
@@ -64,7 +64,7 @@ open /Applications/Myuxcc.app
 | `⌃X` | Toggle Clipboard & File Shelf (customizable in Settings) |
 | `↩` / `⌘C` / Double-click | Copy selection capture to clipboard |
 | `⌘S` | Save capture to the configured folder |
-| `1` – `7` | Select tool: Rectangle, Ellipse, Arrow, Pen, Highlighter, Text, Mosaic |
+| `1` – `7` | Select tool: Rectangle, Ellipse, Pen, Arrow, Highlighter, Text, Mosaic |
 | `8` / `9` or `⌘Z` / `⇧⌘Z` | Undo / Redo annotation |
 | Hold `⇧` while drawing | Constrain to square, circle, or 45° arrow angles |
 | `C` | Copy sRGB hex color under cursor before selecting a region |

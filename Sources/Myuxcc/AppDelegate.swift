@@ -43,6 +43,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var onSessionShown: ((CaptureSession) -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 内存基准测试模式：不创建菜单栏、不注册热键、不查杀主人正在运行的 Myuxcc 实例
+        if CommandLine.arguments.contains("--bench-memory") {
+            let bench = MemoryBench(app: self)
+            Task { @MainActor in await bench.run() }
+            return
+        }
         // Silent e2e: no menu bar icon, no hotkey, no window on screen; needs no permission.
         if let i = CommandLine.arguments.firstIndex(of: "--e2e-silent"), i + 1 < CommandLine.arguments.count {
             let test = E2ETest(app: self, outputDir: CommandLine.arguments[i + 1], silent: true)

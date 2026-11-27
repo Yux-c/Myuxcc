@@ -86,9 +86,11 @@ final class CaptureSession: OverlayViewDelegate {
 
     func overlayDidRequestRecording(_ view: OverlayView) {
         guard longCapture == nil, let sel = view.selection, let screen = view.window?.screen else { return }
+        // 先保存录屏回调再关闭覆盖层，确保 close() 清空会话回调后仍能正常触发录屏
+        let startRecord = onRecord
         // The overlay goes first: the recording shows the live screen.
         close()
-        onRecord?(screen, sel)
+        startRecord?(screen, sel)
     }
 
     private func finishLongCapture(_ action: FinishAction, _ image: CGImage?, pointWidth: CGFloat) {
@@ -145,9 +147,30 @@ final class CaptureSession: OverlayViewDelegate {
 
     private func close() {
         guard !windows.isEmpty else { return } // already closed
-        for w in windows { w.orderOut(nil) }
-        windows.removeAll()
-        views.removeAll()
+        // 在独立 autoreleasepool 中完整拆离全屏截图 OverlayView 与窗口引用，确保退出选区后全屏 Retina 位图立即释放
+        autoreleasepool {
+            longCapture = nil
+            for w in windows {
+                w.orderOut(nil)
+            }
+            for v in views {
+                // 清空代理与窗口吸附回调，并清除选区、标注栈、Undo/Redo 栈与松手检测定时器
+                v.delegate = nil
+                v.windowFrameAt = nil
+                v.clearSelection()
+                v.removeFromSuperview()
+            }
+            for w in windows {
+                // 置空第一响应者、内容视图和代理后再 close()，防止 OverlayWindow 底层缓存滞留全屏位图
+                w.makeFirstResponder(nil)
+                w.contentView = nil
+                w.delegate = nil
+                w.close()
+            }
+            windows.removeAll()
+            views.removeAll()
+            onRecord = nil
+        }
         onFinish(self)
     }
 }

@@ -1,7 +1,8 @@
 import AppKit
 
 enum Tool: CaseIterable {
-    case rectangle, ellipse, arrow, pen, highlighter, text, mosaic
+    // 工具栏从左到右的标注工具顺序：画笔排在箭头之前（对应数字快捷键 1–7）
+    case rectangle, ellipse, pen, arrow, highlighter, text, mosaic
 
     var symbol: String {
         switch self {
@@ -201,7 +202,7 @@ extension Annotation {
         return isTip ? .arrow(a, p, color, width) : .arrow(p, b, color, width)
     }
 
-    /// 若当前标注是第四个工具（画笔）绘制的轨迹，且整体比较直，则自动替换为首尾相连的直线。
+    /// 若当前标注是画笔工具绘制的轨迹，且整体比较直，则自动替换为首尾相连的直线。
     func straightenedIfNeeded() -> Annotation {
         // 仅对不透明的画笔工具生效，保留荧光笔等其他工具的原样
         guard case let .pen(points, color, width) = self, !isHighlighter else { return self }

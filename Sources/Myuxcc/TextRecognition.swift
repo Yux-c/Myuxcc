@@ -89,8 +89,8 @@ enum TextRecognizer {
     private static let workerQueue = DispatchQueue(label: "Myuxcc.ocrWorker", qos: .userInitiated)
     /// 兜底 OCR 子进程空闲超时任务（闲置 120 秒后自动终止子进程释放内存）
     nonisolated(unsafe) private static var workerIdleWorkItem: DispatchWorkItem?
-    /// 兜底 OCR 子进程的最大空闲保活时长（秒）
-    private static let workerIdleTimeout: TimeInterval = 120
+    /// 兜底 OCR 子进程的最大空闲保活时长（秒），缩短为 60 秒以及时释放约 150MB 后台进程内存
+    private static let workerIdleTimeout: TimeInterval = 60
 
     /// 在 workerQueue 上重置子进程空闲自动退出计时器
     private static func scheduleWorkerIdleStop() {
@@ -125,16 +125,19 @@ enum TextRecognizer {
     /// One `VNRecognizeTextRequest`; the boxes come back in image pixels with a top-left origin.
     /// Also used by the out-of-process worker (`--ocr-worker`), which does no retrying of its own.
     static func recognizeSynchronously(_ image: CGImage) throws -> [RecognizedLine] {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
-        request.recognitionLanguages = languages
-        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-        let w = CGFloat(image.width), h = CGFloat(image.height)
-        let lines = (request.results ?? []).compactMap { o -> RecognizedLine? in
-            guard let text = o.topCandidates(1).first?.string, !text.isEmpty else { return nil }
-            let b = o.boundingBox
-            return RecognizedLine(text: text, box: CGRect(x: b.minX * w, y: (1 - b.maxY) * h, width: b.width * w, height: b.height * h))
+        // 在同步 OCR 路径（含无 RunLoop 的 --ocr-worker）中包裹 autoreleasepool，及时释放 Vision/CoreML 临时对象
+        let lines: [RecognizedLine] = try autoreleasepool {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            request.recognitionLanguages = languages
+            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+            let w = CGFloat(image.width), h = CGFloat(image.height)
+            return (request.results ?? []).compactMap { o -> RecognizedLine? in
+                guard let text = o.topCandidates(1).first?.string, !text.isEmpty else { return nil }
+                let b = o.boundingBox
+                return RecognizedLine(text: text, box: CGRect(x: b.minX * w, y: (1 - b.maxY) * h, width: b.width * w, height: b.height * h))
+            }
         }
         return readingOrder(lines)
     }
@@ -143,18 +146,21 @@ enum TextRecognizer {
     private static func recognizeOnce(_ image: CGImage) async throws -> [RecognizedLine] {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let request = VNRecognizeTextRequest()
-                request.recognitionLevel = .accurate
-                request.usesLanguageCorrection = true
-                request.recognitionLanguages = languages
                 do {
-                    try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-                    let w = CGFloat(image.width), h = CGFloat(image.height)
-                    let lines = (request.results ?? []).compactMap { o -> RecognizedLine? in
-                        guard let text = o.topCandidates(1).first?.string, !text.isEmpty else { return nil }
-                        // Vision boxes are normalised with a bottom-left origin.
-                        let b = o.boundingBox
-                        return RecognizedLine(text: text, box: CGRect(x: b.minX * w, y: (1 - b.maxY) * h, width: b.width * w, height: b.height * h))
+                    // GCD 后台工作线程不会自动排空自动释放池，需显式包裹 autoreleasepool 释放 Vision/Metal/IOSurface 临时对象
+                    let lines: [RecognizedLine] = try autoreleasepool {
+                        let request = VNRecognizeTextRequest()
+                        request.recognitionLevel = .accurate
+                        request.usesLanguageCorrection = true
+                        request.recognitionLanguages = languages
+                        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+                        let w = CGFloat(image.width), h = CGFloat(image.height)
+                        return (request.results ?? []).compactMap { o -> RecognizedLine? in
+                            guard let text = o.topCandidates(1).first?.string, !text.isEmpty else { return nil }
+                            // Vision boxes are normalised with a bottom-left origin.
+                            let b = o.boundingBox
+                            return RecognizedLine(text: text, box: CGRect(x: b.minX * w, y: (1 - b.maxY) * h, width: b.width * w, height: b.height * h))
+                        }
                     }
                     continuation.resume(returning: readingOrder(lines))
                 } catch {
@@ -200,22 +206,25 @@ enum TextRecognizer {
     /// after launch keeps the user's first OCR fast.
     static func warmUp() {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
-            // The text models are only loaded when there is text to read.
-            guard let ctx = CGContext(data: nil, width: 320, height: 64, bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
-            ctx.setFillColor(.white)
-            ctx.fill(CGRect(x: 0, y: 0, width: 320, height: 64))
-            let line = CTLineCreateWithAttributedString(NSAttributedString(string: "预热 Warm up", attributes: [
-                .font: NSFont.systemFont(ofSize: 28), .foregroundColor: NSColor.black,
-            ]))
-            ctx.textPosition = CGPoint(x: 10, y: 20)
-            CTLineDraw(line, ctx)
-            guard let image = ctx.makeImage() else { return }
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.recognitionLanguages = languages
-            try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+            // 后台预热线程同样需要 autoreleasepool，防止预热图像与 Vision 对象常驻工作线程自动释放池
+            autoreleasepool {
+                // The text models are only loaded when there is text to read.
+                guard let ctx = CGContext(data: nil, width: 320, height: 64, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+                ctx.setFillColor(.white)
+                ctx.fill(CGRect(x: 0, y: 0, width: 320, height: 64))
+                let line = CTLineCreateWithAttributedString(NSAttributedString(string: "预热 Warm up", attributes: [
+                    .font: NSFont.systemFont(ofSize: 28), .foregroundColor: NSColor.black,
+                ]))
+                ctx.textPosition = CGPoint(x: 10, y: 20)
+                CTLineDraw(line, ctx)
+                guard let image = ctx.makeImage() else { return }
+                let request = VNRecognizeTextRequest()
+                request.recognitionLevel = .accurate
+                request.recognitionLanguages = languages
+                try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+            }
         }
     }
 
@@ -299,7 +308,8 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
     /// Set by the silent e2e test: receives the controller instead of the window being shown.
     static var testPresenter: ((TextRecognitionController) -> Void)?
 
-    let image: CGImage
+    /// OCR 启动前暂存的源图，识别任务启动后立即置 nil 释放大图内存
+    private var image: CGImage?
     private(set) var lines: [RecognizedLine]?
     private(set) var failure: String?
     private(set) var elapsed: TimeInterval = 0
@@ -319,6 +329,11 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
     private(set) var translationFailure: String?
     private(set) var translationRunning = false
     private var translationRun = 0
+    /// 识别与翻译异步任务句柄，关闭窗口时主动取消并置空
+    private var recognitionTask: Task<Void, Never>?
+    private var translationTask: Task<Void, Never>?
+    /// 防止 windowWillClose 与 close() 重复清理的幂等标记
+    private var isClosed = false
 
     /// Recognises `image` and shows the result; `near` is the selection on screen, for placing the window.
     /// With `translating` the text is translated as soon as it is read.
@@ -418,7 +433,7 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
         updateCopyButton()
     }
 
-    var text: String { textView.string }
+    var text: String { textView?.string ?? "" }
 
     private func show(near selection: CGRect?) {
         // Beside the selection when there is room, else centred on its screen.
@@ -439,21 +454,32 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
     }
 
     private func start() {
+        guard !isClosed, let targetImage = image else { return }
+        // OCR 启动取出图像后立即置 nil，防止整个窗口生命周期内持续强引用完整原图
+        image = nil
         let started = Date()
-        Task { @MainActor in
+        recognitionTask?.cancel()
+        recognitionTask = Task { @MainActor [weak self] in
             do {
-                lines = try await TextRecognizer.recognize(image)
+                let recognized = try await TextRecognizer.recognize(targetImage)
+                guard !Task.isCancelled, let self, !self.isClosed else { return }
+                self.lines = recognized
+            } catch is CancellationError {
+                return
             } catch {
-                failure = error.localizedDescription
-                lines = []
+                guard !Task.isCancelled, let self, !self.isClosed else { return }
+                self.failure = error.localizedDescription
+                self.lines = []
             }
-            elapsed = Date().timeIntervalSince(started)
-            fill()
+            guard !Task.isCancelled, let self, !self.isClosed else { return }
+            self.elapsed = Date().timeIntervalSince(started)
+            self.fill()
+            self.recognitionTask = nil
         }
     }
 
     private func fill() {
-        guard let lines else { return }
+        guard !isClosed, let lines, let textView else { return }
         textView.string = mergeBox.state == .on ? TextRecognizer.mergingLines(lines) : TextRecognizer.keepingLines(lines)
         showRecognitionStatus()
         translateButton.isEnabled = !lines.isEmpty
@@ -474,11 +500,12 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
 
     /// Translates the text as it is in the upper pane, edits included.
     @objc func translateNow() {
+        guard !isClosed else { return }
         let source = text
         guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if !translating {
             translating = true
-            translationScroll.isHidden = false
+            translationScroll?.isHidden = false
             if Self.testPresenter == nil, window.frame.height < 420 {
                 var frame = window.frame
                 frame.origin.y -= 460 - frame.height
@@ -491,28 +518,34 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
         translation = nil
         translationFailure = nil
         translationRunning = true
-        translationView.string = ""
+        translationView?.string = ""
         status.stringValue = "正在翻译…"
         updateCopyButton()
         let started = Date()
         let target = ScreenTranslator.Target(rawValue: targetPopup.indexOfSelectedItem) ?? .auto
-        Task { @MainActor in
+        // 取消上一次尚未完成的翻译任务并使用弱引用，避免重复触发或关闭窗口后继续持有控制器
+        translationTask?.cancel()
+        translationTask = Task { @MainActor [weak self] in
             do {
                 let (from, to) = try ScreenTranslator.languages(for: source, target: target)
                 let result = try await ScreenTranslator.translate(source, from: from, to: to)
-                guard run == translationRun else { return } // a newer translation has started
-                translation = result
-                translationView.string = result
-                status.stringValue = String(format: "%@ → %@ · %.1f 秒", ScreenTranslator.name(of: from), ScreenTranslator.name(of: to),
-                                            Date().timeIntervalSince(started))
+                guard !Task.isCancelled, let self, !self.isClosed, run == self.translationRun else { return }
+                self.translation = result
+                self.translationView?.string = result
+                self.status.stringValue = String(format: "%@ → %@ · %.1f 秒", ScreenTranslator.name(of: from), ScreenTranslator.name(of: to),
+                                                 Date().timeIntervalSince(started))
+            } catch is CancellationError {
+                return
             } catch {
-                guard run == translationRun else { return }
-                translationFailure = error.localizedDescription
-                translationView.string = error.localizedDescription
-                status.stringValue = "翻译失败"
+                guard !Task.isCancelled, let self, !self.isClosed, run == self.translationRun else { return }
+                self.translationFailure = error.localizedDescription
+                self.translationView?.string = error.localizedDescription
+                self.status.stringValue = "翻译失败"
             }
-            translationRunning = false
-            updateCopyButton()
+            guard !Task.isCancelled, let self, !self.isClosed, run == self.translationRun else { return }
+            self.translationRunning = false
+            self.translationTask = nil
+            self.updateCopyButton()
         }
     }
 
@@ -540,7 +573,7 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
 
     /// Copies the translation once the pane is showing, else the recognised text; edits included.
     @objc func copyAll() {
-        let copied = translating ? translationView.string : text
+        let copied = translating ? (translationView?.string ?? "") : text
         let pb = ImageOutput.pasteboard
         pb.clearContents()
         pb.setString(copied, forType: .string)
@@ -548,11 +581,46 @@ final class TextRecognitionController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        Self.open.removeAll { $0 === self }
+        cleanup()
     }
 
     func close() {
         window.close()
+        // 无界面测试模式（window 未上屏）下 windowWillClose 可能不触发，这里兜底执行统一清理
+        cleanup()
+    }
+
+    /// 统一释放识别结果窗口资源：取消异步任务、清空文本与撤销栈、拆离视图与代理
+    private func cleanup() {
+        guard !isClosed else { return }
+        isClosed = true
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        translationTask?.cancel()
+        translationTask = nil
+        translationRunning = false
+        image = nil
+        lines = nil
+        failure = nil
+        translation = nil
+        translationFailure = nil
+        // 清空两个文本编辑区的撤销历史与文本缓冲，防止 UndoManager 滞留快照
+        textView?.undoManager?.removeAllActions()
+        textView?.string = ""
+        translationView?.undoManager?.removeAllActions()
+        translationView?.string = ""
+        // 解除控件 target 引用并从窗口拆离内容视图与代理
+        mergeBox.target = nil
+        targetPopup.target = nil
+        translateButton.target = nil
+        copyButton.target = nil
+        window.orderOut(nil)
+        window.makeFirstResponder(nil)
+        window.contentView = nil
+        window.delegate = nil
+        textView = nil
+        translationView = nil
+        translationScroll = nil
         Self.open.removeAll { $0 === self }
     }
 }
